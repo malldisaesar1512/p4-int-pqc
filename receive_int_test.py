@@ -46,6 +46,11 @@ bind_layers(INTShim, INTHeader)
 
 
 def handle_packet(pkt):
+    # DEBUG: cetak SEMUA paket yang lewat dulu, biar kita tau paket beneran
+    # nyampe di h2 atau nggak, dan apakah tag INT-nya ada atau nggak.
+    tag = "ADA INT" if pkt.haslayer(INTShim) else "polos (tanpa INT)"
+    print(f"[DEBUG] paket masuk, etherType={hex(pkt.type) if hasattr(pkt,'type') else '?'} -> {tag}", flush=True)
+
     if not pkt.haslayer(INTShim):
         return
     shim = pkt.getlayer(INTShim)
@@ -53,33 +58,33 @@ def handle_packet(pkt):
     if hdr is None:
         return
 
-    print("\n=== Paket INT diterima ===")
-    print(f"  shim.len          : {shim.len} word (=> {shim.len*4} byte total section)")
-    print(f"  header.total_hop  : {hdr.total_hop_cnt}")
+    print("\n=== Paket INT diterima ===", flush=True)
+    print(f"  shim.len          : {shim.len} word (=> {shim.len*4} byte total section)", flush=True)
+    print(f"  header.total_hop  : {hdr.total_hop_cnt}", flush=True)
 
     # payload mentah setelah INTHeader = stack metadata (12 byte/entri) + sisanya IPv4
     raw = bytes(hdr.payload)
     n_meta = hdr.total_hop_cnt
-    print(f"  jumlah metadata entri terbaca : {n_meta}")
+    print(f"  jumlah metadata entri terbaca : {n_meta}", flush=True)
 
     offset = 0
     for i in range(n_meta):
         chunk = raw[offset:offset+12]
         if len(chunk) < 12:
-            print(f"  [!] entri ke-{i} terpotong, cek kembali panjang paket")
+            print(f"  [!] entri ke-{i} terpotong, cek kembali panjang paket", flush=True)
             break
         m = INTMetadata(chunk)
-        print(f"  hop[{i}] switch_id={m.switch_id}  ts={m.ingress_timestamp}  queue_depth={m.queue_depth}")
+        print(f"  hop[{i}] switch_id={m.switch_id}  ts={m.ingress_timestamp}  queue_depth={m.queue_depth}", flush=True)
         offset += 12
 
     ip_layer = pkt.getlayer(IP)
     if ip_layer:
-        print(f"  IPv4 asli: {ip_layer.src} -> {ip_layer.dst}")
-    print("===========================\n")
+        print(f"  IPv4 asli: {ip_layer.src} -> {ip_layer.dst}", flush=True)
+    print("===========================\n", flush=True)
 
 
 def main():
-    print("[receive_int_test] menunggu paket INT di h2 ... (Ctrl+C utk berhenti)")
+    print("[receive_int_test] menunggu paket INT di h2 ... (Ctrl+C utk berhenti)", flush=True)
     sniff(iface="eth0", prn=handle_packet, store=False)
 
 if __name__ == "__main__":
