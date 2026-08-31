@@ -78,7 +78,17 @@ def handle_packet(pkt):
     if hdr is None:
         return
 
-    hops = parse_int_metadata_stack(hdr)
+    raw = bytes(hdr.payload)
+    n = hdr.total_hop_cnt
+    hops = []
+    off = 0
+    for _ in range(n):
+        chunk = raw[off:off + 12]
+        if len(chunk) < 12:
+            break
+        hops.append(INTMetadata(chunk))
+        off += 12
+
     now = time.time()
 
     with lock:
@@ -89,19 +99,24 @@ def handle_packet(pkt):
             s["queue_depths"].append(m.queue_depth)
             s["recent_times"].append(now)
 
-    # Latency end-to-end: baca 8 byte terakhir payload IP sbg waktu kirim h1
-    ip_layer = pkt.getlayer(IP)
-    if ip_layer is not None:
-        raw_payload = bytes(ip_layer.payload)
-        if len(raw_payload) >= 8:
-            try:
+    # PENTING: sisa raw bytes setelah metadata stack adalah paket IP asli.
+    # scapy TIDAK otomatis mem-parsing ini sebagai layer IP (karena kita
+    # tidak bind_layers dari INTHeader ke IP -- jumlah metadata dinamis
+    # jadi tidak bisa dipetakan statis). pkt.getlayer(IP) akan selalu None
+    # di sini -- makanya harus di-parse manual dari bytes mentah juga.
+    ip_bytes = raw[off:]
+    if len(ip_bytes) >= 20:
+        try:
+            ip_pkt = IP(ip_bytes)
+            raw_payload = bytes(ip_pkt.payload)  # UDP header (8B) + data
+            if len(raw_payload) >= 8:
                 sent_ts = struct.unpack("!d", raw_payload[-8:])[0]
                 latency_ms = (now - sent_ts) * 1000
                 if 0 <= latency_ms < 60_000:
                     with lock:
                         e2e_latencies_ms.append(latency_ms)
-            except struct.error:
-                pass
+        except Exception:
+            pass
 
 
 def throughput_pps(switch_id):
