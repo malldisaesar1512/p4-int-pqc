@@ -118,9 +118,11 @@ parser MyParser(packet_in packet,
 
     state parse_int_header {
         packet.extract(hdr.int_header);
-        // shim.len dalam word 4-byte; (shim 4B + header 8B) = 12B tetap.
-        // Sisanya adalah metadata stack yang sudah ada, tiap entri 12B.
-        meta.int_hop_count = (bit<8>)((((bit<16>)hdr.int_shim.len * 4) - 12) / 12);
+        // total_hop_cnt SUDAH menyimpan langsung jumlah metadata entri yang
+        // ada di stack (di-increment tiap hop nambah metadata di egress).
+        // Nggak perlu dihitung ulang dari shim.len (itu butuh pembagian
+        // runtime yang nggak didukung BMv2 -- makanya versi sebelumnya error).
+        meta.int_hop_count = hdr.int_header.total_hop_cnt;
         meta.int_hop_idx = 0;
         transition select(meta.int_hop_count) {
             0:       parse_ipv4;
