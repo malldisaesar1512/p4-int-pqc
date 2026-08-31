@@ -85,7 +85,8 @@ def handle_packet(pkt):
 
 def main():
     print("[receive_int_test] menunggu paket INT di h2 ... (Ctrl+C utk berhenti)", flush=True)
-    sniff(iface="eth0", prn=handle_packet, store=False)
+    sniff(iface="eth0", prn=handle_packet, store=False,
+          filter="ether proto 0x0800 or ether proto 0x1212")
 
 if __name__ == "__main__":
     main()
