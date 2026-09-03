@@ -37,6 +37,7 @@ class INTMetadata(Packet):
         IntField("switch_id", 0),
         IntField("ingress_timestamp", 0),
         IntField("queue_depth", 0),
+        IntField("mac", 0),
     ]
 
 bind_layers(Ether, INTShim, type=TYPE_INT)
@@ -69,13 +70,13 @@ def handle_packet(pkt):
 
     offset = 0
     for i in range(n_meta):
-        chunk = raw[offset:offset+12]
-        if len(chunk) < 12:
+        chunk = raw[offset:offset+16]
+        if len(chunk) < 16:
             print(f"  [!] entri ke-{i} terpotong, cek kembali panjang paket", flush=True)
             break
         m = INTMetadata(chunk)
-        print(f"  hop[{i}] switch_id={m.switch_id}  ts={m.ingress_timestamp}  queue_depth={m.queue_depth}", flush=True)
-        offset += 12
+        print(f"  hop[{i}] switch_id={m.switch_id}  ts={m.ingress_timestamp}  queue_depth={m.queue_depth}  mac={hex(m.mac)}", flush=True)
+        offset += 16
 
     ip_layer = pkt.getlayer(IP)
     if ip_layer:

@@ -41,7 +41,8 @@ class INTHeader(Packet):
 
 class INTMetadata(Packet):
     name = "INTMetadata"
-    fields_desc = [IntField("switch_id", 0), IntField("ingress_timestamp", 0), IntField("queue_depth", 0)]
+    fields_desc = [IntField("switch_id", 0), IntField("ingress_timestamp", 0),
+                   IntField("queue_depth", 0), IntField("mac", 0)]
 
 bind_layers(Ether, INTShim, type=TYPE_INT)
 bind_layers(INTShim, INTHeader)
@@ -55,19 +56,24 @@ stats = defaultdict(lambda: {
 e2e_latencies_ms = deque(maxlen=ROLLING_WINDOW)
 total_packets = 0
 
+META_ENTRY_SIZE = 16  # byte per entri (switch_id + ts + queue_depth + mac, masing2 4 byte)
+
 
 def parse_int_metadata_stack(hdr):
+    """Kembalikan (list_hop, sisa_bytes_setelah_stack). Dipakai di satu
+    tempat saja (handle_packet) supaya ukuran entri (16 byte) tidak
+    terduplikasi jadi dua sumber kebenaran yang bisa saling berbeda."""
     raw = bytes(hdr.payload)
     n = hdr.total_hop_cnt
     hops = []
     off = 0
     for _ in range(n):
-        chunk = raw[off:off + 12]
-        if len(chunk) < 12:
+        chunk = raw[off:off + META_ENTRY_SIZE]
+        if len(chunk) < META_ENTRY_SIZE:
             break
         hops.append(INTMetadata(chunk))
-        off += 12
-    return hops
+        off += META_ENTRY_SIZE
+    return hops, raw[off:]
 
 
 def handle_packet(pkt):
@@ -78,17 +84,7 @@ def handle_packet(pkt):
     if hdr is None:
         return
 
-    raw = bytes(hdr.payload)
-    n = hdr.total_hop_cnt
-    hops = []
-    off = 0
-    for _ in range(n):
-        chunk = raw[off:off + 12]
-        if len(chunk) < 12:
-            break
-        hops.append(INTMetadata(chunk))
-        off += 12
-
+    hops, ip_bytes = parse_int_metadata_stack(hdr)
     now = time.time()
 
     with lock:
@@ -99,12 +95,10 @@ def handle_packet(pkt):
             s["queue_depths"].append(m.queue_depth)
             s["recent_times"].append(now)
 
-    # PENTING: sisa raw bytes setelah metadata stack adalah paket IP asli.
-    # scapy TIDAK otomatis mem-parsing ini sebagai layer IP (karena kita
-    # tidak bind_layers dari INTHeader ke IP -- jumlah metadata dinamis
-    # jadi tidak bisa dipetakan statis). pkt.getlayer(IP) akan selalu None
-    # di sini -- makanya harus di-parse manual dari bytes mentah juga.
-    ip_bytes = raw[off:]
+    # PENTING: ip_bytes (sisa raw setelah metadata stack) adalah paket IP
+    # asli. scapy TIDAK otomatis mem-parsing ini sbg layer IP (kita tidak
+    # bind_layers dari INTHeader ke IP -- jumlah metadata dinamis, tidak
+    # bisa dipetakan statis). pkt.getlayer(IP) akan selalu None di sini.
     if len(ip_bytes) >= 20:
         try:
             ip_pkt = IP(ip_bytes)
@@ -155,6 +149,9 @@ def render_dashboard():
             print("Latency end-to-end: belum ada data (pastikan pakai send_int_test.py versi terbaru)")
 
         print(f"\nTotal paket INT diterima sejak start: {total}")
+        print("(Kalau ada paket di-drop karena MAC invalid di P4, itu TIDAK akan")
+        print(" muncul di sini -- bandingkan angka ini dengan jumlah yang dikirim")
+        print(" h1 utk tau apakah ada yang hilang di tengah jalan)")
         print("\n(Ctrl+C untuk berhenti)")
 
 

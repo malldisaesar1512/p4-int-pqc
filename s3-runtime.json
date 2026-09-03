@@ -1,26 +1,52 @@
 {
-  "_comment": "TEMPLATE — sesuaikan format dengan s3-runtime.json yang sudah jalan. s3 juga bukan sumber INT, hanya transit terakhir sebelum h2.",
+  "_comment": "TEMPLATE \u2014 sesuaikan format dengan s3-runtime.json yang sudah jalan. s3 juga bukan sumber INT, hanya transit terakhir sebelum h2.",
   "target": "bmv2",
-  "p4info": "build/int_source.p4info.txt",
+  "p4info": "build/int_source.p4.p4info.txtpb",
   "bmv2_json": "build/int_source.json",
   "table_entries": [
     {
       "table": "MyIngress.switch_id_table",
       "default_action": true,
       "action_name": "MyIngress.set_switch_id",
-      "action_params": { "sw_id": 3 }
+      "action_params": {
+        "sw_id": 3
+      }
+    },
+    {
+      "table": "MyIngress.mac_key_table",
+      "default_action": true,
+      "action_name": "MyIngress.set_mac_key",
+      "action_params": {
+        "key": 3735928559
+      }
     },
     {
       "table": "MyIngress.ipv4_lpm",
-      "match": { "hdr.ipv4.dstAddr": ["10.0.2.2", 32] },
+      "match": {
+        "hdr.ipv4.dstAddr": [
+          "10.0.2.2",
+          32
+        ]
+      },
       "action_name": "MyIngress.ipv4_forward",
-      "action_params": { "dstAddr": "08:00:00:00:02:22", "port": 2 }
+      "action_params": {
+        "dstAddr": "08:00:00:00:02:22",
+        "port": 2
+      }
     },
     {
       "table": "MyIngress.ipv4_lpm",
-      "match": { "hdr.ipv4.dstAddr": ["10.0.1.1", 32] },
+      "match": {
+        "hdr.ipv4.dstAddr": [
+          "10.0.1.1",
+          32
+        ]
+      },
       "action_name": "MyIngress.ipv4_forward",
-      "action_params": { "dstAddr": "08:00:00:00:01:11", "port": 1 }
+      "action_params": {
+        "dstAddr": "08:00:00:00:01:11",
+        "port": 1
+      }
     }
   ]
 }
