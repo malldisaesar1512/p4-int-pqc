@@ -1,9 +1,13 @@
 /* -*- P4_16 -*- */
 /*
- * FASE 1: INT dasar tanpa crypto/MAC.
- * Tujuan: memverifikasi bahwa metadata INT (switch_id, timestamp, queue depth)
- * berhasil disisipkan di switch sumber dan ditambahkan (append) oleh setiap
- * switch transit, lalu bisa dibaca utuh di host tujuan.
+ * FASE 1 + FASE 2: INT dengan CRC32 placeholder MAC per-hop.
+ * Fase 1: metadata INT (switch_id, timestamp, queue depth) disisipkan di
+ * switch sumber dan ditambahkan (append) oleh setiap switch transit.
+ * Fase 2 (baru): tiap entri metadata sekarang juga bawa field `mac`
+ * (CRC32 atas field lain + shared key). Switch penerima memverifikasi MAC
+ * milik entri SEBELUM menambahkan entrinya sendiri -- kalau tidak valid,
+ * paket di-drop. Shared key masih SAMA di semua switch (placeholder);
+ * nanti di fase PQC baru didistribusikan/dirotasi lewat kanal terenkripsi.
  *
  * Topologi asumsi: h1 -- s1 -- s2 -- s3 -- h2 (linear).
  * Satu file .p4 ini dipakai untuk KETIGA switch; identitas switch_id dan
@@ -68,15 +72,20 @@ header int_header_t {
     bit<16> rsvd;
 }
 
-// Satu entri metadata per hop: 3 field x 4 byte = 12 byte
+// Satu entri metadata per hop: 4 field x 4 byte = 16 byte
+// (field ke-4, `mac`, adalah CRC32 placeholder yang dihitung dari 3 field
+// lain + shared key -- akan diganti algoritma yang lebih kuat di fase lanjut)
 header int_metadata_t {
     bit<32> switch_id;
     bit<32> ingress_timestamp;
     bit<32> queue_depth;
+    bit<32> mac;
 }
 
 struct metadata {
     bit<32> switch_id;     // diisi oleh switch_id_table (per switch, via runtime entry)
+    bit<32> mac_key;       // shared secret placeholder (sama di semua switch utk Fase 2)
+    bit<8>  mac_valid;     // hasil verifikasi MAC hop sebelumnya (1=valid, 0=invalid)
     bit<8>  int_hop_count; // dipakai parser utk tahu berapa banyak metadata yang SUDAH ada
     bit<8>  int_hop_idx;
 }
@@ -176,6 +185,37 @@ control MyIngress(inout headers hdr,
         size = 1;
     }
 
+    action set_mac_key(bit<32> key) {
+        meta.mac_key = key;
+    }
+
+    // Fase 2: SATU shared key yang SAMA di semua switch (placeholder).
+    // Nanti di fase PQC, kunci ini yang bakal didistribusikan/rotasi lewat
+    // kanal PQC-TLS dari controller, bukan hardcode sama di semua switch.
+    table mac_key_table {
+        actions = { set_mac_key; NoAction; }
+        default_action = NoAction();
+        size = 1;
+    }
+
+    // Verifikasi MAC milik entri metadata TERBARU (int_meta[0]), yaitu yang
+    // ditambahkan oleh switch SEBELUMNYA di jalur ini. Dipanggil di ingress,
+    // sebelum switch ini menambahkan entrinya sendiri di egress.
+    action verify_prev_hop_mac() {
+        bit<32> computed_mac;
+        hash(computed_mac, HashAlgorithm.crc32, (bit<32>)0,
+             { hdr.int_meta[0].switch_id,
+               hdr.int_meta[0].ingress_timestamp,
+               hdr.int_meta[0].queue_depth,
+               meta.mac_key },
+             (bit<32>)0xFFFFFFFF);
+        if (computed_mac == hdr.int_meta[0].mac) {
+            meta.mac_valid = 1;
+        } else {
+            meta.mac_valid = 0;
+        }
+    }
+
     action ipv4_forward(macAddr_t dstAddr, egressSpec_t port) {
         standard_metadata.egress_spec = port;
         hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
@@ -192,6 +232,19 @@ control MyIngress(inout headers hdr,
 
     apply {
         switch_id_table.apply();
+        mac_key_table.apply();
+
+        // Hanya verifikasi kalau paket ini SUDAH bawa minimal 1 metadata
+        // entri dari switch sebelumnya (switch sumber yg pertama kali
+        // menerima dari host tidak punya apa-apa utk diverifikasi).
+        if (hdr.int_header.isValid() && hdr.int_header.total_hop_cnt > 0) {
+            verify_prev_hop_mac();
+            if (meta.mac_valid == 0) {
+                drop();
+                exit;   // hentikan pemrosesan, jangan lanjut ke forwarding
+            }
+        }
+
         if (hdr.ipv4.isValid()) {
             ipv4_lpm.apply();
         }
@@ -216,7 +269,7 @@ control MyEgress(inout headers hdr,
         hdr.int_shim.len      = 3;   // shim(1 word) + header(2 word); metadata ditambah setelah ini
         hdr.int_shim.dscp     = 0;
         hdr.int_header.ver_flags       = 0;
-        hdr.int_header.ins_cnt         = 3;
+        hdr.int_header.ins_cnt         = 4;
         hdr.int_header.max_hop_cnt     = MAX_HOPS;
         hdr.int_header.total_hop_cnt   = 0;
         hdr.int_header.instruction_mask = 0;
@@ -234,16 +287,23 @@ control MyEgress(inout headers hdr,
         size = 8;
     }
 
-    // Menambahkan SATU entri metadata baru di depan stack (push_front).
-    // Dipanggil oleh SEMUA switch (sumber maupun transit) selama header INT
-    // sudah valid di titik ini pada pipeline egress.
+    // Menambahkan SATU entri metadata baru di depan stack (push_front),
+    // termasuk menghitung CRC32 sebagai MAC placeholder atas field metadata
+    // + shared key. Dipanggil oleh SEMUA switch (sumber maupun transit)
+    // selama header INT sudah valid di titik ini pada pipeline egress.
     action add_int_metadata() {
         hdr.int_meta.push_front(1);
         hdr.int_meta[0].setValid();
         hdr.int_meta[0].switch_id          = meta.switch_id;
         hdr.int_meta[0].ingress_timestamp  = (bit<32>) standard_metadata.egress_global_timestamp;
         hdr.int_meta[0].queue_depth        = (bit<32>) standard_metadata.deq_qdepth;
-        hdr.int_shim.len       = hdr.int_shim.len + 3;
+        hash(hdr.int_meta[0].mac, HashAlgorithm.crc32, (bit<32>)0,
+             { hdr.int_meta[0].switch_id,
+               hdr.int_meta[0].ingress_timestamp,
+               hdr.int_meta[0].queue_depth,
+               meta.mac_key },
+             (bit<32>)0xFFFFFFFF);
+        hdr.int_shim.len       = hdr.int_shim.len + 4;   // 16 byte = 4 word/entri sekarang
         hdr.int_header.total_hop_cnt = hdr.int_header.total_hop_cnt + 1;
     }
 
