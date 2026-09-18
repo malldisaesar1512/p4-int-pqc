@@ -47,11 +47,6 @@ SWITCHES = [
 
 P4INFO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "int_source.p4.p4info.txtpb")
 
-# Election id lebih tinggi dari yang biasa dipakai run_exercise.py (yang
-# biasanya konstanta kecil), supaya controller ini bisa jadi master dan
-# diizinkan menulis table entry.
-ELECTION_ID = (int(time.time()), 0)
-
 
 def connect_all(p4info_helper):
     conns = []
@@ -60,7 +55,6 @@ def connect_all(p4info_helper):
             name=sw["name"],
             address=sw["addr"],
             device_id=sw["device_id"],
-            election_id=ELECTION_ID,
         )
         conn.MasterArbitrationUpdate()
         conns.append((sw["name"], conn))
