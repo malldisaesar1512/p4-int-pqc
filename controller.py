@@ -32,7 +32,7 @@ import time
 
 # p4runtime_lib ada di utils/ milik repo p4lang/tutorials (dipakai juga
 # oleh run_exercise.py secara internal)
-UTILS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'utils')
+UTILS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'utils')
 sys.path.append(UTILS_PATH)
 
 import p4runtime_lib.bmv2          # noqa: E402
