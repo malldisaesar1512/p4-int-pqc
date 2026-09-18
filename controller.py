@@ -69,7 +69,7 @@ def push_mac_key(p4info_helper, conn, key_value):
         action_name="MyIngress.set_mac_key",
         action_params={"key": key_value},
     )
-    conn.WriteTableEntry(entry, update_type="modify")
+    conn.WriteTableEntry(entry)
 
 
 def main(rotate_interval):
