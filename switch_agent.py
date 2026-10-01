@@ -41,8 +41,8 @@ def ensure_cert():
     if os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH):
         return
     print("[switch_agent] generate cert ML-DSA (sekali saja)...")
-    subprocess.run(["openssl", "genpkey", "-algorithm", "ML-DSA-65", "-out", KEY_PATH], check=True)
-    subprocess.run(["openssl", "req", "-x509", "-new", "-key", KEY_PATH,
+    subprocess.run(["openssl35", "genpkey", "-algorithm", "ML-DSA-65", "-out", KEY_PATH], check=True)
+    subprocess.run(["openssl35", "req", "-x509", "-new", "-key", KEY_PATH,
                      "-out", CERT_PATH, "-days", "3650", "-subj", "/CN=switch-agent"], check=True)
 
 
@@ -51,7 +51,7 @@ def receive_one_key(listen_port):
     hex), lalu proses berhenti (kembali dipanggil lagi oleh loop utama utk
     rotasi berikutnya). Mengembalikan (key_int, elapsed_detik) atau None."""
     cmd = [
-        "openssl", "s_server",
+        "openssl35", "s_server",
         "-accept", str(listen_port),
         "-cert", CERT_PATH, "-key", KEY_PATH,
         "-tls1_3", "-groups", "MLKEM768",
