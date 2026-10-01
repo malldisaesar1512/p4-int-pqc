@@ -5,10 +5,10 @@ import os
 import subprocess
 import time
 
-OPENSSL = os.path.expanduser("~/openssl35/bin/openssl")
-OPENSSL_HOME = os.path.expanduser("~/openssl35")
+OPENSSL_HOME = "/home/ubuntu22/openssl35"
+OPENSSL = f"{OPENSSL_HOME}/bin/openssl"
 
-CERT = os.path.expanduser("~/pqc_collector_cert.pem")
+CERT = "/home/ubuntu22/pqc_collector_cert.pem"
 
 ENV = os.environ.copy()
 ENV["LD_LIBRARY_PATH"] = (
