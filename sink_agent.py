@@ -23,6 +23,9 @@ METRIK YANG DITAMPILKAN & KENAPA:
 import time
 import struct
 import threading
+import json
+import os
+import subprocess
 from collections import deque, defaultdict
 from scapy.all import Packet, bind_layers, ByteField, ShortField, IntField, Ether, IP, AsyncSniffer
 
@@ -57,6 +60,29 @@ e2e_latencies_ms = deque(maxlen=ROLLING_WINDOW)
 total_packets = 0
 
 META_ENTRY_SIZE = 16  # byte per entri (switch_id + ts + queue_depth + mac, masing2 4 byte)
+
+# ============================================================
+# PQC EXPORT CONFIG
+# ============================================================
+
+OPENSSL_HOME = "/home/ubuntu22/openssl35"
+OPENSSL_BIN = f"{OPENSSL_HOME}/bin/openssl"
+
+COLLECTOR_HOST = "127.0.0.1"
+COLLECTOR_PORT = 7001
+
+COLLECTOR_CERT = "/home/ubuntu22/pqc_collector_cert.pem"
+
+EXPORT_INTERVAL = 1.0
+
+OPENSSL_ENV = os.environ.copy()
+OPENSSL_ENV["LD_LIBRARY_PATH"] = (
+    f"{OPENSSL_HOME}/lib64:"
+    f"{OPENSSL_HOME}/lib:"
+    f"{OPENSSL_ENV.get('LD_LIBRARY_PATH', '')}"
+)
+
+export_stop = threading.Event()
 
 
 def parse_int_metadata_stack(hdr):
@@ -120,6 +146,142 @@ def throughput_pps(switch_id):
     span = times[-1] - times[0]
     return (len(times) - 1) / span if span > 0 else 0.0
 
+def build_int_report():
+    """
+    Membuat snapshot statistik INT untuk dikirim ke Collector.
+    """
+
+    now = time.time()
+
+    with lock:
+        report = {
+            "type": "INT_REPORT",
+            "timestamp": now,
+            "total_packets": total_packets,
+            "switches": {},
+        }
+
+        for sw_id, value in stats.items():
+
+            qd = list(value["queue_depths"])
+            times = list(value["recent_times"])
+
+            avg_qd = (
+                sum(qd) / len(qd)
+                if qd else 0.0
+            )
+
+            if len(times) >= 2:
+                span = times[-1] - times[0]
+                pps = (
+                    (len(times) - 1) / span
+                    if span > 0 else 0.0
+                )
+            else:
+                pps = 0.0
+
+            report["switches"][str(sw_id)] = {
+                "count": value["count"],
+                "avg_queue_depth": avg_qd,
+                "throughput_pps": pps,
+            }
+
+        latencies = list(e2e_latencies_ms)
+
+        if latencies:
+            report["latency_avg_ms"] = (
+                sum(latencies) / len(latencies)
+            )
+            report["latency_samples"] = len(latencies)
+        else:
+            report["latency_avg_ms"] = None
+            report["latency_samples"] = 0
+
+    return report
+
+def send_report_pqc(report):
+    """
+    Kirim satu INT report melalui TLS 1.3:
+      - ML-KEM768
+      - ML-DSA-65
+    """
+
+    payload = json.dumps(
+        report,
+        separators=(",", ":")
+    ) + "\n"
+
+    cmd = [
+        OPENSSL_BIN,
+        "s_client",
+        "-connect",
+        f"{COLLECTOR_HOST}:{COLLECTOR_PORT}",
+        "-tls1_3",
+        "-groups",
+        "MLKEM768",
+        "-sigalgs",
+        "ML-DSA-65",
+        "-CAfile",
+        COLLECTOR_CERT,
+        "-quiet",
+        "-no_ign_eof",
+    ]
+
+    start = time.perf_counter()
+
+    try:
+        result = subprocess.run(
+            cmd,
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=OPENSSL_ENV,
+        )
+
+        elapsed_ms = (
+            time.perf_counter() - start
+        ) * 1000
+
+        if result.returncode == 0:
+            print(
+                f"[PQC-EXPORT] report terkirim "
+                f"({elapsed_ms:.2f} ms)",
+                flush=True
+            )
+        else:
+            print(
+                f"[PQC-EXPORT] GAGAL "
+                f"(exit={result.returncode})",
+                flush=True
+            )
+
+            if result.stderr.strip():
+                print(
+                    f"[PQC-EXPORT] stderr: "
+                    f"{result.stderr.strip()}",
+                    flush=True
+                )
+
+    except Exception as e:
+        print(
+            f"[PQC-EXPORT] ERROR: {e}",
+            flush=True
+        )
+
+def export_loop():
+    """
+    Kirim snapshot INT secara periodik.
+    """
+
+    while not export_stop.wait(EXPORT_INTERVAL):
+
+        report = build_int_report()
+
+        if report["total_packets"] == 0:
+            continue
+
+        send_report_pqc(report)
 
 def render_dashboard():
     while True:
@@ -156,12 +318,27 @@ def render_dashboard():
 
 
 def main():
-    sniffer = AsyncSniffer(iface="eth0", prn=handle_packet, store=False,
-                            filter="ether proto 0x1212")
+    sniffer = AsyncSniffer(
+        iface="eth0",
+        prn=handle_packet,
+        store=False,
+        filter="ether proto 0x1212"
+    )
+
     sniffer.start()
+
+    exporter = threading.Thread(
+        target=export_loop,
+        daemon=True
+    )
+
+    exporter.start()
+
     try:
         render_dashboard()
+
     except KeyboardInterrupt:
+        export_stop.set()
         sniffer.stop()
         print("\nBerhenti.")
 
