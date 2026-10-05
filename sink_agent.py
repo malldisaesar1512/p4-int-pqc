@@ -35,8 +35,13 @@ from scapy.all import Packet, bind_layers, ByteField, ShortField, IntField, Ethe
 TYPE_INT = 0x1212
 ROLLING_WINDOW = 20  # jumlah sampel terakhir dipakai utk rolling avg & throughput
 
-# --- Konfigurasi OpenSSL 3.5 eksperimen (sama persis pola switch_agent.py) ---
-OPENSSL_HOME = os.path.expanduser("~/openssl35")
+# --- Konfigurasi OpenSSL 3.5 eksperimen ---
+# SENGAJA pakai path absolut, BUKAN os.path.expanduser("~/openssl35"),
+# karena script ini kadang dijalankan lewat `sudo ~/mininet/util/m h2 ...`
+# yang bikin proses jalan sbg root -- dan "~" buat root itu /root, BUKAN
+# /home/ubuntu22, jadi expanduser akan salah resolve ke /root/openssl35
+# yang nggak ada.
+OPENSSL_HOME = "/home/ubuntu22/openssl35"
 OPENSSL_BIN = os.path.join(OPENSSL_HOME, "bin", "openssl")
 OPENSSL_ENV = os.environ.copy()
 OPENSSL_ENV["LD_LIBRARY_PATH"] = (

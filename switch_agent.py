@@ -39,8 +39,8 @@ P4INFO_PATH = os.path.join(
     "int_source.p4.p4info.txtpb"
 )
 
-CERT_PATH = os.path.expanduser("~/pqc_agent_cert.pem")
-KEY_PATH = os.path.expanduser("~/pqc_agent_key.pem")
+CERT_PATH = "/home/ubuntu22/pqc_agent_cert.pem"
+KEY_PATH = "/home/ubuntu22/pqc_agent_key.pem"
 
 # OpenSSL 3.5 khusus eksperimen
 OPENSSL_BIN = os.path.expanduser("~/openssl35/bin/openssl")
