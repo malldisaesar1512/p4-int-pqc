@@ -176,13 +176,18 @@ def export_to_collector(report_line, host, port, timeout=5):
     try:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE, text=True, env=OPENSSL_ENV)
-        proc.stdin.write(report_line + "\n")
-        proc.stdin.flush()
-        proc.stdin.close()
-        _, stderr = proc.communicate(timeout=timeout)
+        # Serahkan semua (tulis input, tutup stdin, tunggu proses) ke
+        # communicate() -- JANGAN tulis/flush/close stdin manual sebelum
+        # ini, communicate() akan coba nutup stdin lagi dan error kalau
+        # sudah ditutup duluan.
+        _, stderr = proc.communicate(input=report_line + "\n", timeout=timeout)
         if proc.returncode != 0:
             last_export_error = f"exit code {proc.returncode}: {stderr.strip()[:200]}"
             return None
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        last_export_error = "timeout"
+        return None
     except Exception as e:
         last_export_error = f"{type(e).__name__}: {e}"
         return None
