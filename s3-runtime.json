@@ -1,5 +1,5 @@
 {
-  "_comment": "TEMPLATE \u2014 sesuaikan format dengan s2-runtime.json yang sudah jalan. Perhatikan: TIDAK ADA entry untuk MyEgress.int_source di sini, karena s2 bukan switch sumber INT \u2014 dia hanya menambahkan metadata (add_int_metadata jalan otomatis begitu int_header valid dari hop sebelumnya).",
+  "_comment": "s3-runtime.json -- switch TERAKHIR sebelum h2. TIDAK ADA entry MyEgress.int_source di sini, karena s3 bukan switch sumber INT -- dia hanya menambahkan metadata (add_int_metadata jalan otomatis begitu int_header valid dari hop sebelumnya).",
   "target": "bmv2",
   "p4info": "build/int_source.p4.p4info.txtpb",
   "bmv2_json": "build/int_source.json",
@@ -9,7 +9,7 @@
       "default_action": true,
       "action_name": "MyIngress.set_switch_id",
       "action_params": {
-        "sw_id": 2
+        "sw_id": 3
       }
     },
     {
