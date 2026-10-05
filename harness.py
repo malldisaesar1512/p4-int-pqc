@@ -90,9 +90,15 @@ def main():
         apply_profile(profile)
         time.sleep(1)
 
-        # Perkiraan durasi sink_agent perlu hidup: tiap repetisi ~rep_interval
-        # detik, ditambah buffer start-up & buffer akhir.
-        duration = args.reps * args.rep_interval + 15
+        # Perkiraan durasi sink_agent perlu hidup. PENTING: tiap repetisi
+        # BUKAN cuma rep_interval -- ada overhead nyata dari spawn proses
+        # lewat mnexec + import scapy tiap kali send_int_test.py dipanggil
+        # (~1-2 detik ekstra per repetisi), dan di profil jaringan yg
+        # buruk, waktu itu bisa lebih lama lagi. Kasih buffer besar &
+        # kalikan 2x biar aman, daripada sink_agent exit duluan sebelum
+        # semua repetisi selesai terkirim (itu yg kejadian sebelumnya).
+        overhead_per_rep = 3.0
+        duration = args.reps * (args.rep_interval + overhead_per_rep) * 1.3 + 30
 
         print(f"[harness] start sink_agent.py (durasi {duration:.0f}s, label={profile})")
         sink_proc = run_in_h2([

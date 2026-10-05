@@ -225,8 +225,27 @@ def write_csv_row(csv_path, profile_label, total, snapshot, lat_snapshot, export
         writer.writerow(row)
 
 
-def render_dashboard(collector_host, collector_port, csv_path=None, profile_label="unlabeled", duration=None):
+export_in_progress = threading.Event()
+
+
+def _do_export_async(report_line, host, port, csv_path, profile_label, total, snapshot, lat_snapshot):
+    """Dijalankan di thread terpisah supaya export yang lambat (mis. di
+    profil jaringan severe, bisa beberapa detik) TIDAK menahan loop
+    dashboard utama yang harus tetap jalan tiap 1 detik."""
     global last_export_ms, last_export_ok
+    elapsed = export_to_collector(report_line, host, port)
+    if elapsed is not None:
+        last_export_ms = elapsed * 1000
+        last_export_ok = True
+    else:
+        last_export_ok = False
+    if csv_path:
+        write_csv_row(csv_path, profile_label, total, snapshot, lat_snapshot,
+                      last_export_ms if last_export_ok else None, last_export_ok)
+    export_in_progress.clear()
+
+
+def render_dashboard(collector_host, collector_port, csv_path=None, profile_label="unlabeled", duration=None):
     last_exported_total = 0   # dipakai utk deteksi "ada paket baru sejak export terakhir?"
     start_time = time.time()
     while True:
@@ -240,21 +259,18 @@ def render_dashboard(collector_host, collector_port, csv_path=None, profile_labe
             total = total_packets
 
         # Export ke collector HANYA kalau ada paket baru sejak export
-        # terakhir -- biar nggak PQC handshake berulang-ulang ngirim data
-        # yang persis sama (boros & bikin log collector nggak informatif).
-        if total > 0 and total != last_exported_total:
+        # terakhir, DAN tidak ada export lain yang masih berjalan (biar
+        # thread nggak numpuk kalau export sedang lambat). Dijalankan di
+        # thread terpisah supaya loop 1 detik ini TIDAK ikut ketahan.
+        if total > 0 and total != last_exported_total and not export_in_progress.is_set():
             report_line = build_report_line(snapshot, lat_snapshot, total)
-            elapsed = export_to_collector(report_line, collector_host, collector_port)
-            if elapsed is not None:
-                last_export_ms = elapsed * 1000
-                last_export_ok = True
-                last_exported_total = total
-            else:
-                last_export_ok = False
-
-            if csv_path:
-                write_csv_row(csv_path, profile_label, total, snapshot, lat_snapshot,
-                              last_export_ms if last_export_ok else None, last_export_ok)
+            export_in_progress.set()
+            last_exported_total = total
+            threading.Thread(
+                target=_do_export_async,
+                args=(report_line, collector_host, collector_port, csv_path, profile_label, total, snapshot, lat_snapshot),
+                daemon=True,
+            ).start()
 
         print("\033c", end="")  # clear layar (ANSI escape)
         print("=== Dashboard Telemetry INT (live, refresh 1 detik) ===\n")
