@@ -24,6 +24,7 @@ sebagai metrik, ditampilkan juga di dashboard.
 """
 
 import argparse
+import csv
 import os
 import struct
 import subprocess
@@ -194,10 +195,44 @@ def export_to_collector(report_line, host, port, timeout=15):
     return time.time() - t0
 
 
-def render_dashboard(collector_host, collector_port):
+def write_csv_row(csv_path, profile_label, total, snapshot, lat_snapshot, export_ms, export_ok):
+    """Tulis satu baris hasil pengukuran ke CSV (append mode), dipakai
+    harness.py (Fase 7) buat ngumpulin data eksperimen. Kolom switch
+    di-hardcode s1/s2/s3 sesuai topologi testbed ini -- bukan dibikin
+    fully-dynamic, karena overkill utk 3 switch tetap."""
+    is_new = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow([
+                "timestamp", "profile", "total_packets",
+                "s1_count", "s1_avg_qd", "s1_pps",
+                "s2_count", "s2_avg_qd", "s2_pps",
+                "s3_count", "s3_avg_qd", "s3_pps",
+                "avg_latency_ms", "export_ms", "export_ok",
+            ])
+        row = [time.strftime("%Y-%m-%d %H:%M:%S"), profile_label, total]
+        for sw_id in (1, 2, 3):
+            v = snapshot.get(sw_id)
+            if v:
+                qd = v["queue_depths"]
+                avg_qd = sum(qd) / len(qd) if qd else 0
+                row += [v["count"], f"{avg_qd:.2f}", f"{throughput_pps(sw_id):.2f}"]
+            else:
+                row += [0, "0.00", "0.00"]
+        avg_lat = sum(lat_snapshot) / len(lat_snapshot) if lat_snapshot else ""
+        row += [f"{avg_lat:.3f}" if avg_lat != "" else "", f"{export_ms:.2f}" if export_ms else "", export_ok]
+        writer.writerow(row)
+
+
+def render_dashboard(collector_host, collector_port, csv_path=None, profile_label="unlabeled", duration=None):
     global last_export_ms, last_export_ok
     last_exported_total = 0   # dipakai utk deteksi "ada paket baru sejak export terakhir?"
+    start_time = time.time()
     while True:
+        if duration is not None and (time.time() - start_time) >= duration:
+            print(f"\n[sink_agent] durasi {duration}s tercapai, keluar otomatis.")
+            return
         time.sleep(1)
         with lock:
             snapshot = {sw: dict(v) for sw, v in stats.items()}
@@ -216,6 +251,10 @@ def render_dashboard(collector_host, collector_port):
                 last_exported_total = total
             else:
                 last_export_ok = False
+
+            if csv_path:
+                write_csv_row(csv_path, profile_label, total, snapshot, lat_snapshot,
+                              last_export_ms if last_export_ok else None, last_export_ok)
 
         print("\033c", end="")  # clear layar (ANSI escape)
         print("=== Dashboard Telemetry INT (live, refresh 1 detik) ===\n")
@@ -256,16 +295,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--collector-host", default="127.0.0.1")
     parser.add_argument("--collector-port", type=int, default=7001)
+    parser.add_argument("--csv", default=None, help="path CSV utk log hasil (Fase 7 harness)")
+    parser.add_argument("--profile-label", default="unlabeled", help="label profil jaringan, ditulis ke tiap baris CSV")
+    parser.add_argument("--duration", type=float, default=None, help="keluar otomatis setelah N detik (dipakai harness.py)")
     args = parser.parse_args()
 
     sniffer = AsyncSniffer(iface="eth0", prn=handle_packet, store=False,
                             filter="ether proto 0x1212")
     sniffer.start()
     try:
-        render_dashboard(args.collector_host, args.collector_port)
+        render_dashboard(args.collector_host, args.collector_port,
+                          csv_path=args.csv, profile_label=args.profile_label,
+                          duration=args.duration)
     except KeyboardInterrupt:
-        sniffer.stop()
         print("\nBerhenti.")
+    finally:
+        sniffer.stop()
 
 
 if __name__ == "__main__":
