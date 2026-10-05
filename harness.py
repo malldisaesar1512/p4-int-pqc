@@ -32,10 +32,14 @@ import os
 import subprocess
 import time
 
-MNINET_M = os.path.expanduser("~/mininet/util/m")
-BASIC_DIR = os.path.expanduser("~/tutorials/exercises/basic")
+# SENGAJA path absolut, BUKAN os.path.expanduser("~/..."), karena harness
+# ini dijalankan pakai sudo -- "~" buat root itu /root, bukan /home/ubuntu22.
+# (Bug yang sama persis sudah kejadian berkali-kali di file lain, lihat
+# histori chat.)
+MNINET_M = "/home/ubuntu22/mininet/util/m"
+BASIC_DIR = "/home/ubuntu22/tutorials/exercises/basic"
 P4_INT_PQC_DIR = os.path.join(BASIC_DIR, "p4-int-pqc")
-PYTHON_VENV = os.path.expanduser("~/p4dev-python-venv/bin/python3")
+PYTHON_VENV = "/home/ubuntu22/p4dev-python-venv/bin/python3"
 NETPROFILE_SH = os.path.join(P4_INT_PQC_DIR, "netprofile.sh")
 SINK_AGENT_PY = os.path.join(P4_INT_PQC_DIR, "sink_agent.py")
 SEND_TEST_PY = os.path.join(P4_INT_PQC_DIR, "send_int_test.py")
