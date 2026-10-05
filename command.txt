@@ -1,9 +1,1 @@
-sudo apt install -y build-essential perl git && \
-cd ~ && \
-git clone --depth 1 --branch openssl-3.5 https://github.com/openssl/openssl.git openssl35-src && \
-cd openssl35-src && \
-./Configure --prefix=$HOME/openssl35 --openssldir=$HOME/openssl35/ssl && \
-make -j$(nproc) && \
-make install_sw install_ssldirs && \
-echo 'export PATH=$HOME/openssl35/bin:$PATH' >> ~/.bashrc && \
-source ~/.bashrc
+https://drive.google.com/drive/folders/1FuUG-la1SIgphEYDdhA4mVgtj_yBtfez?usp=sharing
