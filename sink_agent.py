@@ -161,7 +161,7 @@ def build_report_line(snapshot, lat_snapshot, total):
 last_export_error = None
 
 
-def export_to_collector(report_line, host, port, timeout=5):
+def export_to_collector(report_line, host, port, timeout=15):
     """Kirim satu baris laporan ke Telemetry Collector lewat PQC-TLS.
     Return elapsed detik kalau sukses, None kalau gagal (dan simpan alasan
     gagalnya ke last_export_error, biar nggak ketelen diam-diam)."""
@@ -196,6 +196,7 @@ def export_to_collector(report_line, host, port, timeout=5):
 
 def render_dashboard(collector_host, collector_port):
     global last_export_ms, last_export_ok
+    last_exported_total = 0   # dipakai utk deteksi "ada paket baru sejak export terakhir?"
     while True:
         time.sleep(1)
         with lock:
@@ -203,14 +204,16 @@ def render_dashboard(collector_host, collector_port):
             lat_snapshot = list(e2e_latencies_ms)
             total = total_packets
 
-        # Export ke collector lewat PQC-TLS (nonblocking terhadap tampilan:
-        # kalau collector belum siap/gagal, dashboard tetap jalan normal)
-        if total > 0:
+        # Export ke collector HANYA kalau ada paket baru sejak export
+        # terakhir -- biar nggak PQC handshake berulang-ulang ngirim data
+        # yang persis sama (boros & bikin log collector nggak informatif).
+        if total > 0 and total != last_exported_total:
             report_line = build_report_line(snapshot, lat_snapshot, total)
             elapsed = export_to_collector(report_line, collector_host, collector_port)
             if elapsed is not None:
                 last_export_ms = elapsed * 1000
                 last_export_ok = True
+                last_exported_total = total
             else:
                 last_export_ok = False
 
