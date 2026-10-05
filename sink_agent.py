@@ -158,9 +158,14 @@ def build_report_line(snapshot, lat_snapshot, total):
     return f"{total};" + ",".join(parts) + f";{avg_lat:.3f}"
 
 
+last_export_error = None
+
+
 def export_to_collector(report_line, host, port, timeout=5):
     """Kirim satu baris laporan ke Telemetry Collector lewat PQC-TLS.
-    Return elapsed detik kalau sukses, None kalau gagal."""
+    Return elapsed detik kalau sukses, None kalau gagal (dan simpan alasan
+    gagalnya ke last_export_error, biar nggak ketelen diam-diam)."""
+    global last_export_error
     cmd = [
         OPENSSL_BIN, "s_client",
         "-connect", f"{host}:{port}",
@@ -170,12 +175,16 @@ def export_to_collector(report_line, host, port, timeout=5):
     t0 = time.time()
     try:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, text=True, env=OPENSSL_ENV)
+                                 stderr=subprocess.PIPE, text=True, env=OPENSSL_ENV)
         proc.stdin.write(report_line + "\n")
         proc.stdin.flush()
         proc.stdin.close()
-        proc.wait(timeout=timeout)
-    except Exception:
+        _, stderr = proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            last_export_error = f"exit code {proc.returncode}: {stderr.strip()[:200]}"
+            return None
+    except Exception as e:
+        last_export_error = f"{type(e).__name__}: {e}"
         return None
     return time.time() - t0
 
@@ -230,7 +239,7 @@ def render_dashboard(collector_host, collector_port):
         elif last_export_ok:
             print(f"Sukses, waktu kirim (handshake+transfer): {last_export_ms:.2f} ms")
         else:
-            print("GAGAL -- pastikan collector.py sudah jalan & port benar")
+            print(f"GAGAL -- {last_export_error}")
 
         print("\n(Ctrl+C untuk berhenti)")
 
