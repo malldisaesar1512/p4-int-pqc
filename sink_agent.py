@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Sink Agent - dashboard terminal live.
-Jalankan TERUS-MENERUS di h2: `h2 python3 -u sink_agent.py`
-(beda dari receive_int_test.py yang sekali print per paket, ini ngumpulin
-statistik berjalan dan nampilin dashboard yang di-refresh tiap 1 detik.)
+Sink Agent - dashboard terminal live + export laporan ke Telemetry Collector
+lewat PQC-TLS (Fase 6).
+
+Jalankan TERUS-MENERUS di h2: `python3 -u sink_agent.py`
 
 METRIK YANG DITAMPILKAN & KENAPA:
 - Queue depth per switch, jumlah paket per switch, throughput per switch:
@@ -13,24 +13,37 @@ METRIK YANG DITAMPILKAN & KENAPA:
 - Latency end-to-end (h1 -> h2): dihitung dari SATU jam saja (wall-clock
   h2, dibandingkan dengan waktu kirim yang ditempel h1 di payload paket).
   INI SENGAJA TIDAK memakai selisih `ingress_timestamp` antar switch dari
-  BMv2, karena `standard_metadata.egress_global_timestamp` dihitung sejak
-  proses simple_switch itu sendiri nyala -- BUKAN jam yang disinkronkan
-  antar switch. Menghitung "latency antar-hop" dari situ akan menghasilkan
-  angka yang salah total (bisa ratusan ms, padahal jaringan ini virtual
-  dalam satu VM yang sama).
+  BMv2, karena itu tidak disinkronkan antar proses switch (lihat histori
+  chat utk penjelasan lengkap).
+
+FASE 6 (baru): setiap 1 detik (bareng refresh dashboard), ringkasan
+statistik dikirim ke Telemetry Collector lewat openssl s_client (PQC-TLS,
+ML-KEM768 + ML-DSA65) -- pola PERSIS seperti controller.py mengirim kunci
+ke switch_agent.py di Fase 5. Waktu kirim (handshake + transfer) dicatat
+sebagai metrik, ditampilkan juga di dashboard.
 """
 
-import time
-import struct
-import threading
-import json
+import argparse
 import os
+import struct
 import subprocess
+import threading
+import time
 from collections import deque, defaultdict
 from scapy.all import Packet, bind_layers, ByteField, ShortField, IntField, Ether, IP, AsyncSniffer
 
 TYPE_INT = 0x1212
 ROLLING_WINDOW = 20  # jumlah sampel terakhir dipakai utk rolling avg & throughput
+
+# --- Konfigurasi OpenSSL 3.5 eksperimen (sama persis pola switch_agent.py) ---
+OPENSSL_HOME = os.path.expanduser("~/openssl35")
+OPENSSL_BIN = os.path.join(OPENSSL_HOME, "bin", "openssl")
+OPENSSL_ENV = os.environ.copy()
+OPENSSL_ENV["LD_LIBRARY_PATH"] = (
+    os.path.join(OPENSSL_HOME, "lib64") + ":" +
+    os.path.join(OPENSSL_HOME, "lib") + ":" +
+    OPENSSL_ENV.get("LD_LIBRARY_PATH", "")
+)
 
 
 class INTShim(Packet):
@@ -58,31 +71,10 @@ stats = defaultdict(lambda: {
 })
 e2e_latencies_ms = deque(maxlen=ROLLING_WINDOW)
 total_packets = 0
+last_export_ms = None       # waktu PQC-TLS export terakhir (ms), None = belum pernah
+last_export_ok = None       # True/False/None
 
 META_ENTRY_SIZE = 16  # byte per entri (switch_id + ts + queue_depth + mac, masing2 4 byte)
-
-# ============================================================
-# PQC EXPORT CONFIG
-# ============================================================
-
-OPENSSL_HOME = "/home/ubuntu22/openssl35"
-OPENSSL_BIN = f"{OPENSSL_HOME}/bin/openssl"
-
-COLLECTOR_HOST = "127.0.0.1"
-COLLECTOR_PORT = 7001
-
-COLLECTOR_CERT = "/home/ubuntu22/pqc_collector_cert.pem"
-
-EXPORT_INTERVAL = 1.0
-
-OPENSSL_ENV = os.environ.copy()
-OPENSSL_ENV["LD_LIBRARY_PATH"] = (
-    f"{OPENSSL_HOME}/lib64:"
-    f"{OPENSSL_HOME}/lib:"
-    f"{OPENSSL_ENV.get('LD_LIBRARY_PATH', '')}"
-)
-
-export_stop = threading.Event()
 
 
 def parse_int_metadata_stack(hdr):
@@ -146,150 +138,62 @@ def throughput_pps(switch_id):
     span = times[-1] - times[0]
     return (len(times) - 1) / span if span > 0 else 0.0
 
-def build_int_report():
+
+def build_report_line(snapshot, lat_snapshot, total):
+    """Satu baris ringkas (CSV sederhana) yang dikirim ke Collector.
+    Format: total_paket;switch_id:count:avg_qd:pps,...;avg_latency_ms
     """
-    Membuat snapshot statistik INT untuk dikirim ke Collector.
-    """
+    parts = []
+    for sw_id in sorted(snapshot.keys()):
+        v = snapshot[sw_id]
+        qd = v["queue_depths"]
+        avg_qd = sum(qd) / len(qd) if qd else 0
+        parts.append(f"{sw_id}:{v['count']}:{avg_qd:.2f}:{throughput_pps(sw_id):.2f}")
+    avg_lat = sum(lat_snapshot) / len(lat_snapshot) if lat_snapshot else -1
+    return f"{total};" + ",".join(parts) + f";{avg_lat:.3f}"
 
-    now = time.time()
 
-    with lock:
-        report = {
-            "type": "INT_REPORT",
-            "timestamp": now,
-            "total_packets": total_packets,
-            "switches": {},
-        }
-
-        for sw_id, value in stats.items():
-
-            qd = list(value["queue_depths"])
-            times = list(value["recent_times"])
-
-            avg_qd = (
-                sum(qd) / len(qd)
-                if qd else 0.0
-            )
-
-            if len(times) >= 2:
-                span = times[-1] - times[0]
-                pps = (
-                    (len(times) - 1) / span
-                    if span > 0 else 0.0
-                )
-            else:
-                pps = 0.0
-
-            report["switches"][str(sw_id)] = {
-                "count": value["count"],
-                "avg_queue_depth": avg_qd,
-                "throughput_pps": pps,
-            }
-
-        latencies = list(e2e_latencies_ms)
-
-        if latencies:
-            report["latency_avg_ms"] = (
-                sum(latencies) / len(latencies)
-            )
-            report["latency_samples"] = len(latencies)
-        else:
-            report["latency_avg_ms"] = None
-            report["latency_samples"] = 0
-
-    return report
-
-def send_report_pqc(report):
-    """
-    Kirim satu INT report melalui TLS 1.3:
-      - ML-KEM768
-      - ML-DSA-65
-    """
-
-    payload = json.dumps(
-        report,
-        separators=(",", ":")
-    ) + "\n"
-
+def export_to_collector(report_line, host, port, timeout=5):
+    """Kirim satu baris laporan ke Telemetry Collector lewat PQC-TLS.
+    Return elapsed detik kalau sukses, None kalau gagal."""
     cmd = [
-        OPENSSL_BIN,
-        "s_client",
-        "-connect",
-        f"{COLLECTOR_HOST}:{COLLECTOR_PORT}",
-        "-tls1_3",
-        "-groups",
-        "MLKEM768",
-        "-sigalgs",
-        "ML-DSA-65",
-        "-CAfile",
-        COLLECTOR_CERT,
-        "-quiet",
-        "-no_ign_eof",
+        OPENSSL_BIN, "s_client",
+        "-connect", f"{host}:{port}",
+        "-tls1_3", "-groups", "MLKEM768",
+        "-quiet", "-verify_quiet", "-no_ign_eof",
     ]
-
-    start = time.perf_counter()
-
+    t0 = time.time()
     try:
-        result = subprocess.run(
-            cmd,
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=OPENSSL_ENV,
-        )
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, text=True, env=OPENSSL_ENV)
+        proc.stdin.write(report_line + "\n")
+        proc.stdin.flush()
+        proc.stdin.close()
+        proc.wait(timeout=timeout)
+    except Exception:
+        return None
+    return time.time() - t0
 
-        elapsed_ms = (
-            time.perf_counter() - start
-        ) * 1000
 
-        if result.returncode == 0:
-            print(
-                f"[PQC-EXPORT] report terkirim "
-                f"({elapsed_ms:.2f} ms)",
-                flush=True
-            )
-        else:
-            print(
-                f"[PQC-EXPORT] GAGAL "
-                f"(exit={result.returncode})",
-                flush=True
-            )
-
-            if result.stderr.strip():
-                print(
-                    f"[PQC-EXPORT] stderr: "
-                    f"{result.stderr.strip()}",
-                    flush=True
-                )
-
-    except Exception as e:
-        print(
-            f"[PQC-EXPORT] ERROR: {e}",
-            flush=True
-        )
-
-def export_loop():
-    """
-    Kirim snapshot INT secara periodik.
-    """
-
-    while not export_stop.wait(EXPORT_INTERVAL):
-
-        report = build_int_report()
-
-        if report["total_packets"] == 0:
-            continue
-
-        send_report_pqc(report)
-
-def render_dashboard():
+def render_dashboard(collector_host, collector_port):
+    global last_export_ms, last_export_ok
     while True:
         time.sleep(1)
         with lock:
             snapshot = {sw: dict(v) for sw, v in stats.items()}
             lat_snapshot = list(e2e_latencies_ms)
             total = total_packets
+
+        # Export ke collector lewat PQC-TLS (nonblocking terhadap tampilan:
+        # kalau collector belum siap/gagal, dashboard tetap jalan normal)
+        if total > 0:
+            report_line = build_report_line(snapshot, lat_snapshot, total)
+            elapsed = export_to_collector(report_line, collector_host, collector_port)
+            if elapsed is not None:
+                last_export_ms = elapsed * 1000
+                last_export_ok = True
+            else:
+                last_export_ok = False
 
         print("\033c", end="")  # clear layar (ANSI escape)
         print("=== Dashboard Telemetry INT (live, refresh 1 detik) ===\n")
@@ -314,31 +218,30 @@ def render_dashboard():
         print("(Kalau ada paket di-drop karena MAC invalid di P4, itu TIDAK akan")
         print(" muncul di sini -- bandingkan angka ini dengan jumlah yang dikirim")
         print(" h1 utk tau apakah ada yang hilang di tengah jalan)")
+
+        print(f"\n--- Export ke Telemetry Collector ({collector_host}:{collector_port}), PQC-TLS ---")
+        if last_export_ok is None:
+            print("Belum ada percobaan export (menunggu paket pertama)")
+        elif last_export_ok:
+            print(f"Sukses, waktu kirim (handshake+transfer): {last_export_ms:.2f} ms")
+        else:
+            print("GAGAL -- pastikan collector.py sudah jalan & port benar")
+
         print("\n(Ctrl+C untuk berhenti)")
 
 
 def main():
-    sniffer = AsyncSniffer(
-        iface="eth0",
-        prn=handle_packet,
-        store=False,
-        filter="ether proto 0x1212"
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--collector-host", default="127.0.0.1")
+    parser.add_argument("--collector-port", type=int, default=7001)
+    args = parser.parse_args()
 
+    sniffer = AsyncSniffer(iface="eth0", prn=handle_packet, store=False,
+                            filter="ether proto 0x1212")
     sniffer.start()
-
-    exporter = threading.Thread(
-        target=export_loop,
-        daemon=True
-    )
-
-    exporter.start()
-
     try:
-        render_dashboard()
-
+        render_dashboard(args.collector_host, args.collector_port)
     except KeyboardInterrupt:
-        export_stop.set()
         sniffer.stop()
         print("\nBerhenti.")
 
