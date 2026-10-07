@@ -31,7 +31,7 @@ import subprocess
 import threading
 import time
 from collections import deque, defaultdict
-from scapy.all import Packet, bind_layers, ByteField, ShortField, IntField, Ether, IP, AsyncSniffer
+from scapy.all import Packet, bind_layers, ByteField, ShortField, IntField, Ether, IP, TCP, AsyncSniffer
 
 TYPE_INT = 0x1212
 ROLLING_WINDOW = 20  # jumlah sampel terakhir dipakai utk rolling avg & throughput
@@ -162,15 +162,35 @@ def build_report_line(snapshot, lat_snapshot, total):
 last_export_error = None
 
 
-def export_to_collector(report_line, host, port, timeout=15):
-    """Kirim satu baris laporan ke Telemetry Collector lewat PQC-TLS.
-    Return elapsed detik kalau sukses, None kalau gagal (dan simpan alasan
-    gagalnya ke last_export_error, biar nggak ketelen diam-diam)."""
+GROUPS_BY_MODE = {"pqc": "MLKEM768", "classical": "X25519"}
+
+
+def export_to_collector(report_line, host, port, groups, timeout=15):
+    """Kirim satu baris laporan ke Telemetry Collector lewat TLS (PQC atau
+    klasik, tergantung `groups`). Return (elapsed_detik, total_bytes) kalau
+    sukses, (None, 0) kalau gagal (alasan gagalnya ke last_export_error).
+
+    total_bytes dihitung dari CAPTURE TRAFIK BENERAN (scapy, interface lo)
+    selama handshake+kirim berlangsung -- bukan estimasi teoretis. Ini
+    SENGAJA dilakukan di sini (bukan di tool terpisah kayak
+    measure_bytes.py) supaya ikut kena efek kondisi jaringan non-ideal
+    (mis. retransmission TCP akibat packet loss di profil severe), yang
+    nggak akan kelihatan kalau diukur di kondisi bersih/terisolasi."""
     global last_export_error
+    captured = [0]
+
+    def on_pkt(pkt):
+        if pkt.haslayer(TCP):
+            captured[0] += len(pkt)
+
+    sniffer = AsyncSniffer(iface="lo", filter=f"tcp port {port}", prn=on_pkt, store=False)
+    sniffer.start()
+    time.sleep(0.05)
+
     cmd = [
         OPENSSL_BIN, "s_client",
         "-connect", f"{host}:{port}",
-        "-tls1_3", "-groups", "MLKEM768",
+        "-tls1_3", "-groups", groups,
         "-quiet", "-verify_quiet", "-no_ign_eof",
     ]
     t0 = time.time()
@@ -184,18 +204,23 @@ def export_to_collector(report_line, host, port, timeout=15):
         _, stderr = proc.communicate(input=report_line + "\n", timeout=timeout)
         if proc.returncode != 0:
             last_export_error = f"exit code {proc.returncode}: {stderr.strip()[:200]}"
-            return None
+            return None, 0
     except subprocess.TimeoutExpired:
         proc.kill()
         last_export_error = "timeout"
-        return None
+        return None, 0
     except Exception as e:
         last_export_error = f"{type(e).__name__}: {e}"
-        return None
-    return time.time() - t0
+        return None, 0
+    finally:
+        time.sleep(0.1)
+        sniffer.stop()
+
+    return time.time() - t0, captured[0]
 
 
-def write_csv_row(csv_path, profile_label, total, snapshot, lat_snapshot, export_ms, export_ok):
+def write_csv_row(csv_path, profile_label, algo_label, total, snapshot, lat_snapshot,
+                   export_ms, export_ok, export_bytes):
     """Tulis satu baris hasil pengukuran ke CSV (append mode), dipakai
     harness.py (Fase 7) buat ngumpulin data eksperimen. Kolom switch
     di-hardcode s1/s2/s3 sesuai topologi testbed ini -- bukan dibikin
@@ -205,13 +230,13 @@ def write_csv_row(csv_path, profile_label, total, snapshot, lat_snapshot, export
         writer = csv.writer(f)
         if is_new:
             writer.writerow([
-                "timestamp", "profile", "total_packets",
+                "timestamp", "algo", "profile", "total_packets",
                 "s1_count", "s1_avg_qd", "s1_pps",
                 "s2_count", "s2_avg_qd", "s2_pps",
                 "s3_count", "s3_avg_qd", "s3_pps",
-                "avg_latency_ms", "export_ms", "export_ok",
+                "avg_latency_ms", "export_ms", "export_ok", "export_bytes",
             ])
-        row = [time.strftime("%Y-%m-%d %H:%M:%S"), profile_label, total]
+        row = [time.strftime("%Y-%m-%d %H:%M:%S"), algo_label, profile_label, total]
         for sw_id in (1, 2, 3):
             v = snapshot.get(sw_id)
             if v:
@@ -221,36 +246,46 @@ def write_csv_row(csv_path, profile_label, total, snapshot, lat_snapshot, export
             else:
                 row += [0, "0.00", "0.00"]
         avg_lat = sum(lat_snapshot) / len(lat_snapshot) if lat_snapshot else ""
-        row += [f"{avg_lat:.3f}" if avg_lat != "" else "", f"{export_ms:.2f}" if export_ms else "", export_ok]
+        row += [f"{avg_lat:.3f}" if avg_lat != "" else "", f"{export_ms:.2f}" if export_ms else "",
+                 export_ok, export_bytes]
         writer.writerow(row)
 
 
 export_in_progress = threading.Event()
 
 
-def _do_export_async(report_line, host, port, csv_path, profile_label, total, snapshot, lat_snapshot):
+def _do_export_async(report_line, host, port, groups, csv_path, profile_label, algo_label, total, snapshot, lat_snapshot):
     """Dijalankan di thread terpisah supaya export yang lambat (mis. di
     profil jaringan severe, bisa beberapa detik) TIDAK menahan loop
     dashboard utama yang harus tetap jalan tiap 1 detik."""
     global last_export_ms, last_export_ok
-    elapsed = export_to_collector(report_line, host, port)
+    elapsed, export_bytes = export_to_collector(report_line, host, port, groups)
     if elapsed is not None:
         last_export_ms = elapsed * 1000
         last_export_ok = True
     else:
         last_export_ok = False
     if csv_path:
-        write_csv_row(csv_path, profile_label, total, snapshot, lat_snapshot,
-                      last_export_ms if last_export_ok else None, last_export_ok)
+        write_csv_row(csv_path, profile_label, algo_label, total, snapshot, lat_snapshot,
+                      last_export_ms if last_export_ok else None, last_export_ok, export_bytes)
     export_in_progress.clear()
 
 
-def render_dashboard(collector_host, collector_port, csv_path=None, profile_label="unlabeled", duration=None):
+def render_dashboard(collector_host, collector_port, mode="pqc", csv_path=None, profile_label="unlabeled", duration=None):
+    groups = GROUPS_BY_MODE[mode]
     last_exported_total = 0   # dipakai utk deteksi "ada paket baru sejak export terakhir?"
     start_time = time.time()
     while True:
         if duration is not None and (time.time() - start_time) >= duration:
-            print(f"\n[sink_agent] durasi {duration}s tercapai, keluar otomatis.")
+            if export_in_progress.is_set():
+                # PENTING: ada export (thread daemon) yang masih jalan --
+                # kalau langsung return di sini, thread itu bisa dibunuh
+                # paksa SEBELUM sempat nulis baris CSV-nya (walau datanya
+                # sendiri sudah terkirim ke collector). Tunggu dulu max 10
+                # detik biar export terakhir ini sempat selesai & tercatat.
+                print(f"\n[sink_agent] durasi {duration}s tercapai, menunggu export terakhir selesai...")
+                export_in_progress.wait(timeout=10)
+            print(f"[sink_agent] keluar otomatis.")
             return
         time.sleep(1)
         with lock:
@@ -268,7 +303,7 @@ def render_dashboard(collector_host, collector_port, csv_path=None, profile_labe
             last_exported_total = total
             threading.Thread(
                 target=_do_export_async,
-                args=(report_line, collector_host, collector_port, csv_path, profile_label, total, snapshot, lat_snapshot),
+                args=(report_line, collector_host, collector_port, groups, csv_path, profile_label, mode, total, snapshot, lat_snapshot),
                 daemon=True,
             ).start()
 
@@ -296,7 +331,7 @@ def render_dashboard(collector_host, collector_port, csv_path=None, profile_labe
         print(" muncul di sini -- bandingkan angka ini dengan jumlah yang dikirim")
         print(" h1 utk tau apakah ada yang hilang di tengah jalan)")
 
-        print(f"\n--- Export ke Telemetry Collector ({collector_host}:{collector_port}), PQC-TLS ---")
+        print(f"\n--- Export ke Telemetry Collector ({collector_host}:{collector_port}), mode={mode} ---")
         if last_export_ok is None:
             print("Belum ada percobaan export (menunggu paket pertama)")
         elif last_export_ok:
@@ -311,6 +346,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--collector-host", default="127.0.0.1")
     parser.add_argument("--collector-port", type=int, default=7001)
+    parser.add_argument("--mode", choices=["pqc", "classical"], default="pqc",
+                         help="HARUS sama dengan mode collector.py yang lagi jalan")
     parser.add_argument("--csv", default=None, help="path CSV utk log hasil (Fase 7 harness)")
     parser.add_argument("--profile-label", default="unlabeled", help="label profil jaringan, ditulis ke tiap baris CSV")
     parser.add_argument("--duration", type=float, default=None, help="keluar otomatis setelah N detik (dipakai harness.py)")
@@ -320,7 +357,7 @@ def main():
                             filter="ether proto 0x1212")
     sniffer.start()
     try:
-        render_dashboard(args.collector_host, args.collector_port,
+        render_dashboard(args.collector_host, args.collector_port, mode=args.mode,
                           csv_path=args.csv, profile_label=args.profile_label,
                           duration=args.duration)
     except KeyboardInterrupt:

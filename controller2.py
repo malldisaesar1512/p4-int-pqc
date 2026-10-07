@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-FASE 5: Controller -- kirim kunci lewat PQC-TLS ke switch_agent.py di tiap
-switch (BUKAN langsung P4Runtime lagi -- itu tugas switch_agent.py sekarang).
+FASE 5 (+ baseline klasik): Controller -- kirim kunci lewat TLS ke
+switch_agent.py di tiap switch (BUKAN langsung P4Runtime -- itu tugas
+switch_agent.py).
 
-Alurnya:
-  controller.py --(generate kunci baru)--> openssl s_client (PQC-TLS,
-  ML-KEM768 + ML-DSA65) --> switch_agent.py (tiap switch) --> P4Runtime
-  lokal switch itu sendiri.
-
-Jalankan SETELAH ketiga switch_agent.py (s1, s2, s3) sudah jalan dan
-dengerin di port masing-masing.
+Mendukung --mode pqc (default, ML-KEM768) atau --mode classical (X25519).
+HARUS sama persis dengan --mode yang dipakai ketiga switch_agent.py.
 """
 
 import argparse
@@ -18,8 +14,7 @@ import random
 import subprocess
 import time
 
-# --- Konfigurasi OpenSSL 3.5 eksperimen (pola sama persis spt switch_agent.py) ---
-OPENSSL_HOME = os.path.expanduser("~/openssl35")
+OPENSSL_HOME = "/home/ubuntu22/openssl35"
 OPENSSL_BIN = os.path.join(OPENSSL_HOME, "bin", "openssl")
 OPENSSL_ENV = os.environ.copy()
 OPENSSL_ENV["LD_LIBRARY_PATH"] = (
@@ -28,6 +23,8 @@ OPENSSL_ENV["LD_LIBRARY_PATH"] = (
     OPENSSL_ENV.get("LD_LIBRARY_PATH", "")
 )
 
+GROUPS_BY_MODE = {"pqc": "MLKEM768", "classical": "X25519"}
+
 AGENTS = [
     {"name": "s1", "host": "127.0.0.1", "port": 6001},
     {"name": "s2", "host": "127.0.0.1", "port": 6002},
@@ -35,14 +32,11 @@ AGENTS = [
 ]
 
 
-def send_key_pqc(host, port, key_hex, timeout=5):
-    """Kirim satu baris hex key ke switch_agent lewat openssl s_client
-    (PQC-TLS: ML-KEM768 key exchange). Return elapsed detik, atau None
-    kalau gagal."""
+def send_key(host, port, key_hex, groups, timeout=5):
     cmd = [
         OPENSSL_BIN, "s_client",
         "-connect", f"{host}:{port}",
-        "-tls1_3", "-groups", "MLKEM768",
+        "-tls1_3", "-groups", groups,
         "-quiet", "-verify_quiet", "-no_ign_eof",
     ]
     t0 = time.time()
@@ -59,10 +53,10 @@ def send_key_pqc(host, port, key_hex, timeout=5):
     return time.time() - t0
 
 
-def main(rotate_interval):
-    print(f"[controller] {OPENSSL_BIN}")
-    print(f"[controller] mode PQC-TLS aktif. Pastikan switch_agent.py sudah")
-    print(f"             jalan di ketiga switch sebelum lanjut.\n")
+def main(rotate_interval, mode):
+    groups = GROUPS_BY_MODE[mode]
+    print(f"[controller] mode={mode} (groups={groups}). Pastikan switch_agent.py")
+    print(f"             sudah jalan di ketiga switch dgn --mode {mode} juga.\n")
 
     try:
         while True:
@@ -70,9 +64,9 @@ def main(rotate_interval):
             key_hex = format(new_key, "x")
             print(f"[controller] rotasi mac_key -> {hex(new_key)}  (jam {time.strftime('%H:%M:%S')})")
             for agent in AGENTS:
-                elapsed = send_key_pqc(agent["host"], agent["port"], key_hex)
+                elapsed = send_key(agent["host"], agent["port"], key_hex, groups)
                 if elapsed is not None:
-                    print(f"  - {agent['name']}: terkirim via PQC-TLS ({elapsed*1000:.2f} ms)")
+                    print(f"  - {agent['name']}: terkirim via {mode} ({elapsed*1000:.2f} ms)")
             time.sleep(rotate_interval)
     except KeyboardInterrupt:
         print("\n[controller] dihentikan oleh user.")
@@ -80,6 +74,7 @@ def main(rotate_interval):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--interval", type=int, default=15, help="detik antar rotasi key (default 15)")
+    parser.add_argument("--interval", type=int, default=15)
+    parser.add_argument("--mode", choices=["pqc", "classical"], default="pqc")
     args = parser.parse_args()
-    main(args.interval)
+    main(args.interval, args.mode)
