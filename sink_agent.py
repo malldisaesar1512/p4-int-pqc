@@ -26,6 +26,7 @@ sebagai metrik, ditampilkan juga di dashboard.
 import argparse
 import csv
 import os
+import resource
 import struct
 import subprocess
 import threading
@@ -167,8 +168,8 @@ GROUPS_BY_MODE = {"pqc": "MLKEM768", "classical": "X25519"}
 
 def export_to_collector(report_line, host, port, groups, timeout=15):
     """Kirim satu baris laporan ke Telemetry Collector lewat TLS (PQC atau
-    klasik, tergantung `groups`). Return (elapsed_detik, total_bytes) kalau
-    sukses, (None, 0) kalau gagal (alasan gagalnya ke last_export_error).
+    klasik, tergantung `groups`). Return (elapsed_detik, total_bytes, cpu_ms_anak) kalau
+    sukses, (None, 0, 0.0) kalau gagal (alasan gagalnya ke last_export_error).
 
     total_bytes dihitung dari CAPTURE TRAFIK BENERAN (scapy, interface lo)
     selama handshake+kirim berlangsung -- bukan estimasi teoretis. Ini
@@ -193,34 +194,40 @@ def export_to_collector(report_line, host, port, groups, timeout=15):
         "-tls1_3", "-groups", groups,
         "-quiet", "-verify_quiet", "-no_ign_eof",
     ]
-    t0 = time.time()
+    elapsed = None
+    cpu_ms = 0.0
     try:
+        ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        t0 = time.perf_counter()
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE, text=True, env=OPENSSL_ENV)
-        # Serahkan semua (tulis input, tutup stdin, tunggu proses) ke
-        # communicate() -- JANGAN tulis/flush/close stdin manual sebelum
-        # ini, communicate() akan coba nutup stdin lagi dan error kalau
-        # sudah ditutup duluan.
         _, stderr = proc.communicate(input=report_line + "\n", timeout=timeout)
+        # PENTING: stopwatch dihentikan LANGSUNG di sini, SEBELUM
+        # sniffer.stop(). Sebelumnya `time.time() - t0` dihitung setelah
+        # blok finally, sehingga waktu sniffer.stop() (scapy join thread,
+        # ~puluhan-100 ms) ikut kehitung sbg "waktu kirim".
+        elapsed = time.perf_counter() - t0
+        ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        cpu_ms = ((ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime)) * 1000
         if proc.returncode != 0:
             last_export_error = f"exit code {proc.returncode}: {stderr.strip()[:200]}"
-            return None, 0
+            return None, 0, 0.0
     except subprocess.TimeoutExpired:
         proc.kill()
         last_export_error = "timeout"
-        return None, 0
+        return None, 0, 0.0
     except Exception as e:
         last_export_error = f"{type(e).__name__}: {e}"
-        return None, 0
+        return None, 0, 0.0
     finally:
-        #time.sleep(0.1)
+        time.sleep(0.05)   # kasih waktu paket FIN/ACK terakhir tertangkap utk hitung byte (di luar stopwatch)
         sniffer.stop()
 
-    return time.time() - t0, captured[0]
+    return elapsed, captured[0], cpu_ms
 
 
 def write_csv_row(csv_path, profile_label, algo_label, total, snapshot, lat_snapshot,
-                   export_ms, export_ok, export_bytes):
+                   export_ms, export_ok, export_bytes, client_cpu_ms=0.0):
     """Tulis satu baris hasil pengukuran ke CSV (append mode), dipakai
     harness.py (Fase 7) buat ngumpulin data eksperimen. Kolom switch
     di-hardcode s1/s2/s3 sesuai topologi testbed ini -- bukan dibikin
@@ -234,7 +241,7 @@ def write_csv_row(csv_path, profile_label, algo_label, total, snapshot, lat_snap
                 "s1_count", "s1_avg_qd", "s1_pps",
                 "s2_count", "s2_avg_qd", "s2_pps",
                 "s3_count", "s3_avg_qd", "s3_pps",
-                "avg_latency_ms", "export_ms", "export_ok", "export_bytes",
+                "avg_latency_ms", "export_ms", "export_ok", "export_bytes", "client_cpu_ms",
             ])
         row = [time.strftime("%Y-%m-%d %H:%M:%S"), algo_label, profile_label, total]
         for sw_id in (1, 2, 3):
@@ -247,7 +254,7 @@ def write_csv_row(csv_path, profile_label, algo_label, total, snapshot, lat_snap
                 row += [0, "0.00", "0.00"]
         avg_lat = sum(lat_snapshot) / len(lat_snapshot) if lat_snapshot else ""
         row += [f"{avg_lat:.3f}" if avg_lat != "" else "", f"{export_ms:.2f}" if export_ms else "",
-                 export_ok, export_bytes]
+                 export_ok, export_bytes, f"{client_cpu_ms:.2f}"]
         writer.writerow(row)
 
 
@@ -259,7 +266,7 @@ def _do_export_async(report_line, host, port, groups, csv_path, profile_label, a
     profil jaringan severe, bisa beberapa detik) TIDAK menahan loop
     dashboard utama yang harus tetap jalan tiap 1 detik."""
     global last_export_ms, last_export_ok
-    elapsed, export_bytes = export_to_collector(report_line, host, port, groups)
+    elapsed, export_bytes, cpu_ms = export_to_collector(report_line, host, port, groups)
     if elapsed is not None:
         last_export_ms = elapsed * 1000
         last_export_ok = True
@@ -267,7 +274,7 @@ def _do_export_async(report_line, host, port, groups, csv_path, profile_label, a
         last_export_ok = False
     if csv_path:
         write_csv_row(csv_path, profile_label, algo_label, total, snapshot, lat_snapshot,
-                      last_export_ms if last_export_ok else None, last_export_ok, export_bytes)
+                      last_export_ms if last_export_ok else None, last_export_ok, export_bytes, cpu_ms)
     export_in_progress.clear()
 
 
