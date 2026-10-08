@@ -89,9 +89,15 @@ def find_pids(patterns):
         try:
             if p.info["pid"] == me or (p.info["name"] or "") in WRAPPER_NAMES:
                 continue
-            cmd = " ".join(p.info["cmdline"] or [])
+            argv = p.info["cmdline"] or []
+            cmd = " ".join(argv)
+            exe = os.path.basename(argv[0]) if argv else ""
             for label, pat in patterns.items():
-                if pat in cmd:
+                # Biner switch dicocokkan lewat nama executable-nya (argv[0]),
+                # bukan substring, supaya launcher Mininet/run_exercise.py yang
+                # cuma menyebut "simple_switch_grpc" di argumennya tidak ikut.
+                matched = (exe == pat) if pat == "simple_switch_grpc" else (pat in cmd)
+                if matched:
                     result[label].append(p.info["pid"])
                     break
         except (psutil.NoSuchProcess, psutil.AccessDenied):
