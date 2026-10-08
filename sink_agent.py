@@ -27,6 +27,7 @@ import argparse
 import csv
 import os
 import resource
+import socket
 import struct
 import subprocess
 import threading
@@ -166,27 +167,65 @@ last_export_error = None
 GROUPS_BY_MODE = {"pqc": "MLKEM768", "classical": "X25519"}
 
 
+class LoByteCounter:
+    """Hitung byte TCP di loopback TANPA dobel. Di `lo`, tiap paket muncul
+    2x di PF_PACKET (salinan OUTGOING saat dikirim + salinan HOST saat
+    diterima), sehingga sniffer biasa (scapy/tcpdump -w) menghitung dobel.
+    Di sini hanya salinan PACKET_OUTGOING yang dihitung. Satuan = byte frame
+    termasuk header Ethernet 14B (sama dgn 'Data size' di capinfos).
+    Raw socket tanpa scapy -> overhead per paket juga jauh lebih kecil."""
+
+    def __init__(self, iface, port):
+        self.port = port
+        self.total = 0
+        self._stop = threading.Event()
+        self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+        self.sock.bind((iface, 0))
+        self.sock.settimeout(0.05)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                data, sa = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if sa[2] != socket.PACKET_OUTGOING:
+                continue
+            if len(data) < 38 or data[12:14] != b"\x08\x00" or data[23] != 6:
+                continue
+            ihl = (data[14] & 0x0F) * 4
+            off = 14 + ihl
+            if len(data) < off + 4:
+                continue
+            sport = int.from_bytes(data[off:off + 2], "big")
+            dport = int.from_bytes(data[off + 2:off + 4], "big")
+            if sport == self.port or dport == self.port:
+                self.total += len(data)
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=1)
+        self.sock.close()
+        return self.total
+
+
 def export_to_collector(report_line, host, port, groups, timeout=15):
     """Kirim satu baris laporan ke Telemetry Collector lewat TLS (PQC atau
     klasik, tergantung `groups`). Return (elapsed_detik, total_bytes, cpu_ms_anak) kalau
     sukses, (None, 0, 0.0) kalau gagal (alasan gagalnya ke last_export_error).
 
-    total_bytes dihitung dari CAPTURE TRAFIK BENERAN (scapy, interface lo)
+    total_bytes dihitung dari CAPTURE TRAFIK BENERAN (raw AF_PACKET, interface lo, tanpa dobel)
     selama handshake+kirim berlangsung -- bukan estimasi teoretis. Ini
     SENGAJA dilakukan di sini (bukan di tool terpisah kayak
     measure_bytes.py) supaya ikut kena efek kondisi jaringan non-ideal
     (mis. retransmission TCP akibat packet loss di profil severe), yang
     nggak akan kelihatan kalau diukur di kondisi bersih/terisolasi."""
     global last_export_error
-    captured = [0]
-
-    def on_pkt(pkt):
-        if pkt.haslayer(TCP):
-            captured[0] += len(pkt)
-
-    sniffer = AsyncSniffer(iface="lo", filter=f"tcp port {port}", prn=on_pkt, store=False)
-    sniffer.start()
-    time.sleep(0.05)
+    counter = LoByteCounter("lo", port)
 
     cmd = [
         OPENSSL_BIN, "s_client",
@@ -221,9 +260,9 @@ def export_to_collector(report_line, host, port, groups, timeout=15):
         return None, 0, 0.0
     finally:
         time.sleep(0.05)   # kasih waktu paket FIN/ACK terakhir tertangkap utk hitung byte (di luar stopwatch)
-        sniffer.stop()
+        total_bytes = counter.stop()
 
-    return elapsed, captured[0], cpu_ms
+    return elapsed, total_bytes, cpu_ms
 
 
 def write_csv_row(csv_path, profile_label, algo_label, total, snapshot, lat_snapshot,
