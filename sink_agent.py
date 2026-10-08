@@ -213,7 +213,7 @@ def export_to_collector(report_line, host, port, groups, timeout=15):
         last_export_error = f"{type(e).__name__}: {e}"
         return None, 0
     finally:
-        time.sleep(0.1)
+        #time.sleep(0.1)
         sniffer.stop()
 
     return time.time() - t0, captured[0]
