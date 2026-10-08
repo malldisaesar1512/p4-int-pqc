@@ -62,6 +62,12 @@ SEND_TEST_PY = os.path.join(P4_INT_PQC_DIR, "send_int_test.py")
 
 PROFILES = ["ideal", "moderate", "severe"]
 
+# Jeda antar repetisi DEFAULT per profil (detik). Disesuaikan dgn lamanya
+# satu export di profil itu supaya paket nggak numpuk/gabung ke export
+# berikutnya: ideal ~20 ms, moderate ~0.3-1.5 s, severe ~1.2-5 s.
+# Bisa di-override semua profil sekaligus lewat --rep-interval.
+REP_INTERVAL_BY_PROFILE = {"ideal": 2.0, "moderate": 3.5, "severe": 7.0}
+
 # Proses NYATA yang mau dipantau CPU/RAM-nya selagi sistem beneran jalan
 # (bukan proses isolated spt measure_bytes.py). simple_switch_grpc
 # diikutkan juga biar kebaca beban di sisi P4 switch (walau crypto-nya
@@ -195,8 +201,9 @@ def main():
     parser.add_argument("--reps", type=int, default=5,
                          help="jumlah repetisi per profil (default 5 utk validasi dulu; naikkan ke 30 utk data final)")
     parser.add_argument("--csv", default=os.path.join(BASIC_DIR, "results.csv"))
-    parser.add_argument("--rep-interval", type=float, default=2.0,
-                         help="jeda detik antar repetisi, beri waktu export tiap siklus")
+    parser.add_argument("--rep-interval", type=float, default=None,
+                         help="jeda detik antar repetisi utk SEMUA profil. Kalau tidak diisi, pakai default per profil: "
+                              "ideal=2.0, moderate=3.5, severe=7.0")
     parser.add_argument("--algo", choices=["pqc", "classical"], default="pqc",
                          help="HARUS sama dgn mode collector.py/controller.py/switch_agent.py yg lagi jalan manual")
     parser.add_argument("--resource-csv", default=os.path.join(BASIC_DIR, "resource_usage.csv"))
@@ -213,6 +220,9 @@ def main():
         print(f"[harness] === PROFIL: {profile} ===")
         print(f"{'='*60}")
 
+        rep_interval = args.rep_interval if args.rep_interval is not None else REP_INTERVAL_BY_PROFILE[profile]
+        print(f"[harness] jeda antar repetisi utk profil {profile}: {rep_interval}s")
+
         apply_profile(profile)
         time.sleep(1)
 
@@ -224,7 +234,7 @@ def main():
         # kalikan 2x biar aman, daripada sink_agent exit duluan sebelum
         # semua repetisi selesai terkirim (itu yg kejadian sebelumnya).
         overhead_per_rep = 3.0
-        duration = args.reps * (args.rep_interval + overhead_per_rep) * 1.3 + 30
+        duration = args.reps * (rep_interval + overhead_per_rep) * 1.3 + 30
 
         print(f"[harness] start sink_agent.py (durasi {duration:.0f}s, label={profile})")
         sink_proc = run_in_h2([
@@ -247,7 +257,7 @@ def main():
                 run_in_h1([PYTHON_VENV, "-u", SEND_TEST_PY, "10.0.2.2", "1", "0.1"], timeout=10)
             except subprocess.TimeoutExpired:
                 print(f"[harness]   [!] repetisi {rep} timeout saat kirim, lanjut saja")
-            time.sleep(args.rep_interval)
+            time.sleep(rep_interval)
 
         print(f"[harness] repetisi selesai, tunggu 5s buffer lalu coba hentikan sink_agent...")
         time.sleep(5)
