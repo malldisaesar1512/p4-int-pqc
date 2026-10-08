@@ -68,7 +68,7 @@ PROFILES = ["ideal", "moderate", "severe"]
 # sendiri nggak jalan di situ, switch tetap kerja verifikasi SipHash/CRC
 # dan forwarding, jadi tetap relevan dibandingkan).
 PROCESS_PATTERNS = {
-    "controller": "controller.py",
+    "controller": "controller2.py",
     "switch_agent": "switch_agent.py",
     "collector": "collector.py",
     "sink_agent": "sink_agent.py",
@@ -76,14 +76,26 @@ PROCESS_PATTERNS = {
 }
 
 
+# Nama proses pembungkus (sudo / m / mnexec / shell) yang cmdline-nya juga
+# memuat nama script, tapi BUKAN proses kerja sebenarnya -- dibuang supaya
+# satu komponen tidak terhitung 2-3x.
+WRAPPER_NAMES = {"sudo", "m", "mnexec", "bash", "sh", "dash", "pgrep"}
+
+
 def find_pids(patterns):
-    result = {}
-    for name, pattern in patterns.items():
+    result = {name: [] for name in patterns}
+    me = os.getpid()
+    for p in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
-            out = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
-            result[name] = [int(p) for p in out.stdout.split()]
-        except Exception:
-            result[name] = []
+            if p.info["pid"] == me or (p.info["name"] or "") in WRAPPER_NAMES:
+                continue
+            cmd = " ".join(p.info["cmdline"] or [])
+            for label, pat in patterns.items():
+                if pat in cmd:
+                    result[label].append(p.info["pid"])
+                    break
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
     return result
 
 
@@ -110,6 +122,8 @@ class ResourceMonitor:
             # Priming call wajib: panggilan pertama cpu_percent() selalu
             # balikin 0.0/nggak akurat, baru akurat dari panggilan kedua.
             pid_map = find_pids(PROCESS_PATTERNS)
+            print("[harness] PID terdeteksi (harapan: controller=1, switch_agent=3, collector=1, sink_agent=1, simple_switch_grpc=3): "
+                  + ", ".join(f"{k}={len(v)}" for k, v in pid_map.items()), flush=True)
             for name, pids in pid_map.items():
                 for pid in pids:
                     try:
