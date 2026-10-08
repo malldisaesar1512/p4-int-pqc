@@ -259,7 +259,7 @@ def export_to_collector(report_line, host, port, groups, timeout=15):
         last_export_error = f"{type(e).__name__}: {e}"
         return None, 0, 0.0
     finally:
-        time.sleep(0.05)   # kasih waktu paket FIN/ACK terakhir tertangkap utk hitung byte (di luar stopwatch)
+        time.sleep(0.5)    # tunggu paket FIN/ACK terakhir yg masih ditahan netem (delay s/d ~250ms) agar byte lengkap; di luar stopwatch
         total_bytes = counter.stop()
 
     return elapsed, total_bytes, cpu_ms
