@@ -89,10 +89,25 @@ header int_metadata_t {
     bit<32> mac;
 }
 
+// State SipHash yang dibawa antar-tahap (tabel) -- lihat blok SIPHASH di bawah.
+struct sip_state_t {
+    bit<128> key;
+    bit<32>  f0;
+    bit<32>  f1;
+    bit<32>  f2;
+    bit<64>  v0;
+    bit<64>  v1;
+    bit<64>  v2;
+    bit<64>  v3;
+    bit<64>  m0;
+    bit<64>  m1;
+    bit<32>  tag;
+}
+
 struct metadata {
     bit<32> switch_id;     // diisi oleh switch_id_table (per switch, via runtime entry)
     bit<128> mac_key;      // kunci SipHash 128-bit (sama di semua switch; dirotasi lewat PQC-TLS)
-    bit<32> mac_computed;  // hasil SipHash (32-bit rendah dari tag 64-bit)
+    sip_state_t sip;       // state & hasil SipHash (meta.sip.tag = 32-bit rendah dari tag 64-bit)
     bit<8>  mac_valid;     // hasil verifikasi MAC hop sebelumnya (1=valid, 0=invalid)
     bit<8>  int_hop_count; // dipakai parser utk tahu berapa banyak metadata yang SUDAH ada
     bit<8>  int_hop_idx;
@@ -179,9 +194,14 @@ control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
 //   - kunci  : k0 = key[63:0], k1 = key[127:64]  (nilai numerik, = byte kunci
 //              little-endian: k0 = LE64(kunci[0:8]), k1 = LE64(kunci[8:16]))
 //   - pesan  : 12 byte = LE32(f0) || LE32(f1) || LE32(f2)
-//              blok 1 m0 = (f1 << 32) | f0 ; blok akhir b = (12 << 56) | f2
+//              blok 1 m0 = (f1 << 32) | f0 ; blok akhir m1 = (12 << 56) | f2
 //   - keluaran: 32 bit rendah dari (v0 ^ v1 ^ v2 ^ v3) -> tag 32-bit
 // Semua operasi hanya + (mod 2^64), xor, or, shift: aman utk ALU switch P4.
+//
+// BENTUK PIPELINE: tiap tahap (init, 8 SipRound, dst.) = SATU tabel tanpa
+// key dgn satu action; state dibawa di struct sip_state_t. Ini mirip cara
+// kriptografi dipetakan ke stage pipeline hardware, dan jauh lebih ringan
+// buat p4c daripada satu blok lurus ~126 pernyataan (versi awal macet >8 mnt).
 
 const bit<64> SIP_C0 = 64w0x736f6d6570736575;
 const bit<64> SIP_C1 = 64w0x646f72616e646f6d;
@@ -190,57 +210,77 @@ const bit<64> SIP_C3 = 64w0x7465646279746573;
 
 #define ROTL(x, l, r) (((x) << (l)) | ((x) >> (r)))
 
-#define SIPROUND \
-    v0 = v0 + v1; \
-    v1 = ROTL(v1, 13, 51); \
-    v1 = v1 ^ v0; \
-    v0 = ROTL(v0, 32, 32); \
-    v2 = v2 + v3; \
-    v3 = ROTL(v3, 16, 48); \
-    v3 = v3 ^ v2; \
-    v0 = v0 + v3; \
-    v3 = ROTL(v3, 21, 43); \
-    v3 = v3 ^ v0; \
-    v2 = v2 + v1; \
-    v1 = ROTL(v1, 17, 47); \
-    v1 = v1 ^ v2; \
-    v2 = ROTL(v2, 32, 32);
+#define SIPROUND_BODY \
+    st.v0 = st.v0 + st.v1; \
+    st.v1 = ROTL(st.v1, 13, 51); \
+    st.v1 = st.v1 ^ st.v0; \
+    st.v0 = ROTL(st.v0, 32, 32); \
+    st.v2 = st.v2 + st.v3; \
+    st.v3 = ROTL(st.v3, 16, 48); \
+    st.v3 = st.v3 ^ st.v2; \
+    st.v0 = st.v0 + st.v3; \
+    st.v3 = ROTL(st.v3, 21, 43); \
+    st.v3 = st.v3 ^ st.v0; \
+    st.v2 = st.v2 + st.v1; \
+    st.v1 = ROTL(st.v1, 17, 47); \
+    st.v1 = st.v1 ^ st.v2; \
+    st.v2 = ROTL(st.v2, 32, 32);
 
-control SipHash24(in bit<128> key,
-                  in bit<32> f0,
-                  in bit<32> f1,
-                  in bit<32> f2,
-                  out bit<32> tag) {
+#define SIPINIT_BODY \
+    st.v0 = st.key[63:0] ^ SIP_C0; \
+    st.v1 = st.key[127:64] ^ SIP_C1; \
+    st.v2 = st.key[63:0] ^ SIP_C2; \
+    st.v3 = st.key[127:64] ^ SIP_C3; \
+    st.m0 = ((bit<64>)st.f1 << 32) | (bit<64>)st.f0; \
+    st.m1 = 64w0x0c00000000000000 | (bit<64>)st.f2; \
+    st.v3 = st.v3 ^ st.m0;
+
+#define SIPMID_BODY \
+    st.v0 = st.v0 ^ st.m0; \
+    st.v3 = st.v3 ^ st.m1;
+
+#define SIPFIN_BODY \
+    st.v0 = st.v0 ^ st.m1; \
+    st.v2 = st.v2 ^ 64w0xff;
+
+#define SIPOUT_BODY \
+    st.tag = (bit<32>)(st.v0 ^ st.v1 ^ st.v2 ^ st.v3);
+
+#define SIP_STAGE(NAME, BODY) \
+    action a_##NAME() { BODY } \
+    table t_##NAME { \
+        actions = { a_##NAME; } \
+        default_action = a_##NAME(); \
+        size = 1; \
+    }
+
+control SipHash24(inout sip_state_t st) {
+    SIP_STAGE(init, SIPINIT_BODY)
+    SIP_STAGE(r0, SIPROUND_BODY)
+    SIP_STAGE(r1, SIPROUND_BODY)
+    SIP_STAGE(mid, SIPMID_BODY)
+    SIP_STAGE(r2, SIPROUND_BODY)
+    SIP_STAGE(r3, SIPROUND_BODY)
+    SIP_STAGE(fin, SIPFIN_BODY)
+    SIP_STAGE(r4, SIPROUND_BODY)
+    SIP_STAGE(r5, SIPROUND_BODY)
+    SIP_STAGE(r6, SIPROUND_BODY)
+    SIP_STAGE(r7, SIPROUND_BODY)
+    SIP_STAGE(out, SIPOUT_BODY)
+
     apply {
-        bit<64> k0 = key[63:0];
-        bit<64> k1 = key[127:64];
-        bit<64> v0 = k0 ^ SIP_C0;
-        bit<64> v1 = k1 ^ SIP_C1;
-        bit<64> v2 = k0 ^ SIP_C2;
-        bit<64> v3 = k1 ^ SIP_C3;
-        bit<64> m0 = ((bit<64>)f1 << 32) | (bit<64>)f0;
-        bit<64> m1 = 64w0x0c00000000000000 | (bit<64>)f2;
-
-        // blok 1 (c = 2 ronde)
-        v3 = v3 ^ m0;
-        SIPROUND
-        SIPROUND
-        v0 = v0 ^ m0;
-
-        // blok akhir: sisa 4 byte + panjang pesan (12) di byte teratas
-        v3 = v3 ^ m1;
-        SIPROUND
-        SIPROUND
-        v0 = v0 ^ m1;
-
-        // finalisasi (d = 4 ronde)
-        v2 = v2 ^ 64w0xff;
-        SIPROUND
-        SIPROUND
-        SIPROUND
-        SIPROUND
-
-        tag = (bit<32>)(v0 ^ v1 ^ v2 ^ v3);
+        t_init.apply();      // v0..v3, m0, m1; v3 ^= m0
+        t_r0.apply();        // blok 1: 2 ronde
+        t_r1.apply();
+        t_mid.apply();       // v0 ^= m0; v3 ^= m1
+        t_r2.apply();        // blok akhir: 2 ronde
+        t_r3.apply();
+        t_fin.apply();       // v0 ^= m1; v2 ^= 0xff
+        t_r4.apply();        // finalisasi: 4 ronde
+        t_r5.apply();
+        t_r6.apply();
+        t_r7.apply();
+        t_out.apply();       // tag 32-bit
     }
 }
 // SIPHASH-END
@@ -307,12 +347,12 @@ control MyIngress(inout headers hdr,
         if (hdr.int_header.isValid() && hdr.int_header.total_hop_cnt > 0) {
             // Verifikasi MAC milik entri metadata TERBARU (int_meta[0]) = yang
             // ditambahkan switch SEBELUMNYA, dgn SipHash-2-4 + kunci aktif.
-            sip_verify.apply(meta.mac_key,
-                             hdr.int_meta[0].switch_id,
-                             hdr.int_meta[0].ingress_timestamp,
-                             hdr.int_meta[0].queue_depth,
-                             meta.mac_computed);
-            if (meta.mac_computed == hdr.int_meta[0].mac) {
+            meta.sip.key = meta.mac_key;
+            meta.sip.f0  = hdr.int_meta[0].switch_id;
+            meta.sip.f1  = hdr.int_meta[0].ingress_timestamp;
+            meta.sip.f2  = hdr.int_meta[0].queue_depth;
+            sip_verify.apply(meta.sip);
+            if (meta.sip.tag == hdr.int_meta[0].mac) {
                 meta.mac_valid = 1;
             } else {
                 meta.mac_valid = 0;
@@ -389,12 +429,12 @@ control MyEgress(inout headers hdr,
         }
         if (hdr.int_header.isValid()) {
             add_int_metadata();   // jalan di switch sumber (lanjutan) & semua transit
-            sip_gen.apply(meta.mac_key,
-                          hdr.int_meta[0].switch_id,
-                          hdr.int_meta[0].ingress_timestamp,
-                          hdr.int_meta[0].queue_depth,
-                          meta.mac_computed);
-            hdr.int_meta[0].mac = meta.mac_computed;
+            meta.sip.key = meta.mac_key;
+            meta.sip.f0  = hdr.int_meta[0].switch_id;
+            meta.sip.f1  = hdr.int_meta[0].ingress_timestamp;
+            meta.sip.f2  = hdr.int_meta[0].queue_depth;
+            sip_gen.apply(meta.sip);
+            hdr.int_meta[0].mac = meta.sip.tag;
         }
     }
 }

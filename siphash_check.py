@@ -99,17 +99,29 @@ def expand_with_cpp(block):
 
 
 def build_python_mac(path):
+    """Terjemahkan blok SIPHASH (setelah cpp) jadi fungsi Python: ambil semua
+    action, petakan tabel -> action default-nya, lalu jalankan urutan
+    `<tabel>.apply()` persis seperti di apply{} control SipHash24."""
+    from types import SimpleNamespace
     code = expand_with_cpp(extract_p4_block(path))
     consts = dict(re.findall(r"const\s+bit<64>\s+(\w+)\s*=\s*64w(0x[0-9a-fA-F]+)\s*;", code))
-    body = re.search(r"apply\s*\{(.*)\}\s*\}", code, re.S).group(1)
 
-    t = body
-    t = re.sub(r"64w(0x[0-9a-fA-F]+)", r"U(\1)", t)                 # literal 64w0x..
-    t = re.sub(r"bit<\d+>\s+(\w+)\s*=", r"\1 =", t)                  # deklarasi+inisialisasi
-    t = re.sub(r"\(bit<64>\)(\w+)", r"U(\1)", t)                     # cast ke 64-bit
-    t = re.sub(r"\(bit<32>\)\(", "T32(", t)                           # cast ke 32-bit
-    t = re.sub(r"(\w+)\[(\d+):(\d+)\]", r"SL(\1,\2,\3)", t)          # slice
-    lines = [l.strip() for l in t.replace(";", "\n").splitlines() if l.strip()]
+    def translate(body):
+        t = body
+        t = re.sub(r"64w(0x[0-9a-fA-F]+)", r"U(\1)", t)
+        t = re.sub(r"\(bit<64>\)([\w.]+)", r"U(\1)", t)
+        t = re.sub(r"\(bit<32>\)\(", "T32(", t)
+        t = re.sub(r"([\w.]+)\[(\d+):(\d+)\]", r"SL(\1,\2,\3)", t)
+        return [l.strip() for l in t.replace(";", "\n").splitlines() if l.strip()]
+
+    actions = {m.group(1): translate(m.group(2))
+               for m in re.finditer(r"action\s+(\w+)\s*\(\s*\)\s*\{(.*?)\}", code, re.S)}
+    tables = {m.group(1): m.group(2)
+              for m in re.finditer(r"table\s+(\w+)\s*\{.*?default_action\s*=\s*(\w+)\s*\(\s*\)", code, re.S)}
+    apply_body = re.search(r"apply\s*\{(.*)\}\s*\}\s*$", code.strip(), re.S).group(1)
+    order = re.findall(r"(\w+)\.apply\s*\(\s*\)", apply_body)
+    assert order and all(t in tables and tables[t] in actions for t in order), "struktur tabel/action tidak terbaca"
+    nstmt = sum(len(actions[tables[t]]) for t in order)
 
     def SL(x, hi, lo):
         return U((int(x) >> lo) & ((1 << (hi - lo + 1)) - 1))
@@ -118,14 +130,17 @@ def build_python_mac(path):
         return int(x) & 0xFFFFFFFF
 
     def mac(key128, f0, f1, f2):
-        env = {"U": U, "SL": SL, "T32": T32, "key": key128, "f0": f0, "f1": f1, "f2": f2}
+        st = SimpleNamespace(key=key128, f0=f0, f1=f1, f2=f2, v0=U(0), v1=U(0), v2=U(0),
+                             v3=U(0), m0=U(0), m1=U(0), tag=0)
+        env = {"U": U, "SL": SL, "T32": T32, "st": st}
         for k, v in consts.items():
             env[k] = U(int(v, 16))
-        for ln in lines:
-            exec(ln, env)
-        return env["tag"]
+        for tname in order:
+            for ln in actions[tables[tname]]:
+                exec(ln, env)
+        return st.tag
 
-    return mac, len(lines)
+    return mac, nstmt, len(order)
 
 
 def main():
@@ -149,7 +164,7 @@ def main():
         print("[1b] pustaka `siphash` tidak terpasang, dilewati (pip install siphash)")
 
     # 2) kode P4 sungguhan vs referensi
-    mac, nstmt = build_python_mac(path)
+    mac, nstmt, ntab = build_python_mac(path)
     cases = [(0, 0, 0, 0), ((1 << 128) - 1,) + (0xFFFFFFFF,) * 3,
              (0x000102030405060708090a0b0c0d0e0f, 1, 2, 3)]
     cases += [(rng.getrandbits(128), rng.getrandbits(32), rng.getrandbits(32), rng.getrandbits(32))
@@ -158,7 +173,7 @@ def main():
     for k, a, b, c in cases:
         if mac(k, a, b, c) != p4_mac(k, a, b, c):
             bad += 1
-    print(f"[2] kode P4 ({nstmt} pernyataan hasil cpp) vs referensi: "
+    print(f"[2] kode P4 ({ntab} tahap/tabel, {nstmt} pernyataan hasil cpp) vs referensi: "
           f"{len(cases) - bad}/{len(cases)} cocok")
     if bad:
         sys.exit("GAGAL: ada ketidakcocokan")
