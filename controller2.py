@@ -10,7 +10,7 @@ HARUS sama persis dengan --mode yang dipakai ketiga switch_agent.py.
 
 import argparse
 import os
-import random
+import secrets
 import subprocess
 import time
 
@@ -60,9 +60,9 @@ def main(rotate_interval, mode):
 
     try:
         while True:
-            new_key = random.getrandbits(32)
+            new_key = secrets.randbits(128)   # kunci SipHash 128-bit, dari CSPRNG (bukan random.*)
             key_hex = format(new_key, "x")
-            print(f"[controller] rotasi mac_key -> {hex(new_key)}  (jam {time.strftime('%H:%M:%S')})")
+            print(f"[controller] rotasi mac_key -> {hex(new_key)[:10]}... (128-bit)  (jam {time.strftime('%H:%M:%S')})")
             for agent in AGENTS:
                 elapsed = send_key(agent["host"], agent["port"], key_hex, groups)
                 if elapsed is not None:
