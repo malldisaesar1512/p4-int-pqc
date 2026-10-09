@@ -34,7 +34,7 @@ import p4runtime_lib.bmv2          # noqa: E402
 import p4runtime_lib.helper        # noqa: E402
 from p4runtime_lib.switch import ShutdownAllSwitchConnections  # noqa: E402
 
-P4INFO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "int_source.p4.p4info.txtpb")
+P4INFO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "siphash.p4.p4info.txtpb")
 
 OPENSSL_HOME = "/home/ubuntu22/openssl35"
 OPENSSL_BIN = os.path.join(OPENSSL_HOME, "bin", "openssl")
