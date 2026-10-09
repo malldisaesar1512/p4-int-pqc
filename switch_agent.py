@@ -21,6 +21,7 @@ JANGAN campur mode beda di tiap switch, controller.py juga harus pakai
 """
 
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
@@ -130,6 +131,9 @@ def main():
     parser.add_argument("--device-id", type=int, required=True)
     parser.add_argument("--listen", type=int, required=True, help="port TLS utk nerima kunci")
     parser.add_argument("--mode", choices=["pqc", "classical"], default="pqc")
+    parser.add_argument("--apply-log", default=None,
+                        help="(opsional) CSV: tiap kunci terpasang, tulis epoch,switch,fingerprint. "
+                             "Dipakai rotation_test.py utk mengukur jendela rotasi.")
     args = parser.parse_args()
     cfg = MODE_CONFIG[args.mode]
 
@@ -154,6 +158,11 @@ def main():
             key_int, elapsed = result
             try:
                 push_mac_key_local(p4info_helper, conn, key_int)
+                t_applied = time.time()   # tepat setelah WriteTableEntry sukses
+                if args.apply_log:
+                    fp = hashlib.sha256(format(key_int, "x").encode()).hexdigest()[:8]
+                    with open(args.apply_log, "a") as lf:
+                        lf.write(f"{t_applied:.6f},{args.switch},{fp}\n")
                 print(f"[switch_agent:{args.switch}] kunci baru {hex(key_int)} terpasang "
                       f"(waktu kirim+terima [{args.mode}]: {elapsed*1000:.2f} ms)")
             except Exception as e:
